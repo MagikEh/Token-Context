@@ -1,0 +1,11 @@
+version: "1.0.0"
+name: show-token-context-hud
+title: Show Token Context HUD
+description: Pins the Token Context HUD above the chat input and reports current context stats
+instructions: |
+  If the `token-context` extension is not enabled in this session (the `token-context__*` tools are absent from your available tools),
+  first enable it by calling `extensionmanager__manage_extensions` with action "enable" and extension_name "token-context",
+  then continue with the new turn.
+  Call the `token-context__show_context_hud` tool to pin the Token Context HUD panel above the chat input.
+  Then call `token-context__get_context_stats` and briefly report the current context usage:
+  tokens used / context window, percentage, and tokens/sec. Do not do anything else.

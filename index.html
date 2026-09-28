@@ -1,0 +1,651 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="light dark" id="metaScheme" />
+  <title>Token Context</title>
+  <style>
+    :root {
+      /* The host sends --color-* values as light-dark(light, dark); the
+         document's color-scheme (mirrored from the host theme in JS) decides
+         which side resolves. These fallbacks cover the brief moment before
+         the first host context arrives. */
+      color-scheme: light dark;
+      --color-background-primary: #1d1d1f;
+      --color-background-secondary: #2a2a2e;
+      --color-background-tertiary: #343438;
+      --color-border-secondary: rgba(255, 255, 255, 0.12);
+      --color-text-primary: #f5f5f7;
+      --color-text-secondary: rgba(245, 245, 247, 0.72);
+      --color-text-tertiary: rgba(245, 245, 247, 0.5);
+      --color-background-info: #0a84ff;
+      --color-background-success: #30d158;
+      --color-background-warning: #ffd60a;
+      --color-background-danger: #ff453a;
+
+      /* Accessibility: the host's muted text tokens are low-opacity and are
+         hard to read at small sizes on the HUD card (worst in dark mode).
+         These local overrides pull the muted roles toward the primary text
+         color, raising contrast in both themes. */
+      --hud-text-secondary: color-mix(in srgb, var(--color-text-secondary) 55%, var(--color-text-primary));
+      --hud-text-tertiary: color-mix(in srgb, var(--color-text-tertiary) 30%, var(--color-text-primary));
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    /* In pip/fullscreen the host frame is a fixed size (PiP: 400x300), so the
+       guest fills it. In inline mode the body hugs its content so the reported
+       size-changed height is the natural content height. */
+    html, body { height: 100%; }
+    html.mode-inline, html.mode-inline body { height: auto; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      /* Opaque, themed background: fills the PiP frame so there is no
+         unthemed gray space around the card (the guest paints its own
+         surface; the host frame can't be resized from here). */
+      background: var(--color-background-primary);
+      color: var(--color-text-primary);
+      -webkit-font-smoothing: antialiased;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 10px;
+    }
+    html.mode-inline body { padding: 6px; }
+
+    .hud {
+      width: 100%;
+      max-width: 380px;
+      background: color-mix(in srgb, var(--color-background-secondary) 82%, transparent);
+      border: 1px solid var(--color-border-secondary);
+      border-radius: 12px;
+      padding: 12px 14px;
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      box-shadow: 0 6px 24px rgba(0, 0, 0, 0.28);
+    }
+
+    .hud-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+
+    .hud-title {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--hud-text-tertiary);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--hud-text-tertiary);
+      flex: none;
+      transition: background 0.25s ease;
+    }
+    .dot.on {
+      background: var(--color-background-success);
+      box-shadow: 0 0 0 0 color-mix(in srgb, var(--color-background-success) 60%, transparent);
+      animation: pulse 1.4s ease-out infinite;
+    }
+    @keyframes pulse {
+      0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--color-background-success) 55%, transparent); }
+      70% { box-shadow: 0 0 0 6px color-mix(in srgb, var(--color-background-success) 0%, transparent); }
+      100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--color-background-success) 0%, transparent); }
+    }
+
+    .model {
+      font-size: 10px;
+      color: var(--hud-text-tertiary);
+      max-width: 190px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      direction: rtl;
+      text-align: left;
+    }
+
+    .tps-row {
+      display: flex;
+      align-items: baseline;
+      gap: 6px;
+      margin-bottom: 10px;
+    }
+    .tps-value {
+      font-size: 26px;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: -0.01em;
+      color: var(--color-text-primary);
+      line-height: 1;
+    }
+    .tps-unit { font-size: 12px; font-weight: 600; color: var(--hud-text-secondary); }
+    .tps-idle { font-size: 12px; color: var(--hud-text-tertiary); font-style: italic; }
+
+    .ctx-top {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      margin-bottom: 6px;
+    }
+    .ctx-label { font-size: 11px; font-weight: 600; color: var(--hud-text-secondary); }
+    .ctx-num {
+      font-size: 11px;
+      color: var(--hud-text-secondary);
+      font-variant-numeric: tabular-nums;
+    }
+    .ctx-num b { color: var(--color-text-primary); font-weight: 700; }
+
+    .bar {
+      height: 8px;
+      border-radius: 999px;
+      background: var(--color-background-tertiary);
+      overflow: hidden;
+      position: relative;
+    }
+    /* The fill is scoped to #fill: the zone/tick markers are also direct
+       children of .bar, and an unscoped `.bar[.state] > span` rule
+       (specificity 0,2,1) would recolor them in every state (0,2,1 beats
+       the 0,2,0 tick/zone background rules). */
+    #fill {
+      position: absolute;
+      inset: 0 auto 0 0;
+      width: 0%;
+      border-radius: 999px;
+      background: var(--color-background-info);
+      transition: width 0.22s ease, background 0.22s ease;
+    }
+    .bar.ok #fill { background: var(--color-background-success); }
+    .bar.warn #fill { background: var(--color-background-warning); }
+    .bar.danger #fill { background: var(--color-background-danger); }
+
+    /* Threshold markers: the bar changes color at the warn/danger
+       thresholds (WARN_PCT/DANGER_PCT in the script). Zone previews on the
+       empty track (subtle at rest, nearly full-strength on hover) plus
+       trigger-coloured 1px ticks — amber at warn, red at danger — which
+       paint above the fill so the boundaries stay visible once the bar
+       turns yellow/red. Positions are set from JS; this is just the look. */
+    .bar .zone,
+    .bar .tick {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      pointer-events: none;
+    }
+    .bar .zone { transition: background 0.15s ease; }
+    .bar .zone-warn {
+      background: color-mix(in srgb, var(--color-background-warning) 18%, transparent);
+    }
+    .bar .zone-danger {
+      background: color-mix(in srgb, var(--color-background-danger) 22%, transparent);
+    }
+    .bar:hover .zone-warn {
+      background: color-mix(in srgb, var(--color-background-warning) 85%, transparent);
+    }
+    .bar:hover .zone-danger {
+      background: color-mix(in srgb, var(--color-background-danger) 85%, transparent);
+    }
+    /* The hairline edge keeps a tick visible when the fill reaches the
+       same colour (e.g. the amber tick once the bar is yellow). */
+    .bar .tick {
+      width: 1px;
+      margin-left: -0.5px;
+      left: 0;
+      box-shadow: 0 0 0 0.5px rgba(0, 0, 0, 0.3);
+    }
+    .bar .tick-warn { background: var(--color-background-warning); }
+    .bar .tick-danger { background: var(--color-background-danger); }
+
+    .tps-tag {
+      font-size: 9px;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: var(--hud-text-tertiary);
+      align-self: center;
+      margin-left: 2px;
+    }
+
+    .ctx-pct {
+      margin-top: 6px;
+      font-size: 11px;
+      font-weight: 700;
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+      color: var(--hud-text-secondary);
+    }
+
+    .foot {
+      margin-top: 10px;
+      padding-top: 8px;
+      border-top: 1px solid var(--color-border-secondary);
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 10px;
+      color: var(--hud-text-tertiary);
+      font-variant-numeric: tabular-nums;
+    }
+    .foot span b { color: var(--hud-text-secondary); font-weight: 600; }
+
+    .err {
+      font-size: 12px;
+      color: var(--color-background-danger);
+      text-align: center;
+      padding: 8px 4px;
+    }
+
+    /* Placeholder for duplicate HUD instances (v1.4.0): when goose reloads
+       the chat (e.g. a theme switch), every app card in history remounts.
+       Only the instance holding the popped-out slot renders the full HUD;
+       siblings shrink to this one line instead of popping another window. */
+    .dup {
+      font-size: 12px;
+      color: var(--hud-text-secondary);
+      padding: 4px 2px;
+    }
+    .dup-dot {
+      display: inline-block;
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--hud-text-tertiary);
+      margin-right: 6px;
+    }
+  </style>
+</head>
+<body>
+  <div class="hud" id="hud">
+    <div class="hud-head">
+      <div class="hud-title"><span class="dot" id="dot"></span>Context</div>
+      <div class="model" id="model">&nbsp;</div>
+    </div>
+
+    <div class="tps-row" id="tpsRow">
+      <span class="tps-idle" id="tpsIdle">warming up&hellip;</span>
+    </div>
+
+    <div class="ctx-top">
+      <span class="ctx-label">Context window</span>
+      <span class="ctx-num" id="ctxNum">&ndash;</span>
+    </div>
+    <div class="bar" id="bar">
+      <span class="zone zone-warn" id="zoneWarn"></span>
+      <span class="zone zone-danger" id="zoneDanger"></span>
+      <span id="fill"></span>
+      <span class="tick tick-warn" id="tickWarn"></span>
+      <span class="tick tick-danger" id="tickDanger"></span>
+    </div>
+    <div class="ctx-pct" id="pct">&ndash;</div>
+
+    <div class="foot">
+      <span>in <b id="fIn">&ndash;</b></span>
+      <span>out <b id="fOut">&ndash;</b></span>
+      <span>cache <b id="fCache">&ndash;</b></span>
+      <span>total <b id="fTotal">&ndash;</b></span>
+    </div>
+  </div>
+
+  <div class="dup" id="dup" style="display: none">
+    <span class="dup-dot"></span>
+    Token Context &mdash; HUD already pinned in this session
+  </div>
+
+  <script>
+    "use strict";
+
+    // ---------------------------------------------------------------------
+    // Minimal MCP App client (postMessage bridge to the goose host).
+    // ---------------------------------------------------------------------
+    class McpAppClient {
+      constructor() {
+        this.pending = new Map();
+        this.id = 0;
+        this.hostContext = null;
+        this.displayMode = null;
+        this.initialized = false;
+        this._lastSize = null;
+        window.addEventListener("message", (e) => this._onMessage(e));
+      }
+
+      request(method, params) {
+        return new Promise((resolve, reject) => {
+          const id = ++this.id;
+          this.pending.set(id, { resolve, reject });
+          window.parent.postMessage({ jsonrpc: "2.0", id, method, params: params || {} }, "*");
+          setTimeout(() => {
+            if (this.pending.has(id)) {
+              this.pending.delete(id);
+              reject(new Error("request timed out: " + method));
+            }
+          }, 30000);
+        });
+      }
+
+      notify(method, params) {
+        window.parent.postMessage({ jsonrpc: "2.0", method, params: params || {} }, "*");
+      }
+
+      _onMessage(e) {
+        const d = e.data;
+        if (!d || typeof d !== "object") return;
+        if (d.id !== undefined && this.pending.has(d.id)) {
+          const p = this.pending.get(d.id);
+          this.pending.delete(d.id);
+          if (d.error) p.reject(new Error(d.error.message || "rpc error"));
+          else p.resolve(d.result);
+          return;
+        }
+        if (d.method === "ui/notifications/host-context-changed" && d.params) {
+          this._applyHostContext(d.params);
+        }
+      }
+
+      /** Swap the mode class on <html>. Returns true if the mode changed. */
+      _setDisplayMode(mode) {
+        if (!mode || mode === this.displayMode) return false;
+        this.displayMode = mode;
+        const root = document.documentElement;
+        for (const m of ["inline", "pip", "fullscreen"]) root.classList.remove("mode-" + m);
+        root.classList.add("mode-" + mode);
+        return true;
+      }
+
+      _applyHostContext(ctx) {
+        if (!ctx || typeof ctx !== "object") return;
+        // The host sends only *changed* fields, so merge into the stored context.
+        this.hostContext = Object.assign({}, this.hostContext, ctx);
+        const hc = this.hostContext;
+
+        // Theme variables.
+        if (hc.styles && hc.styles.variables) {
+          const root = document.documentElement;
+          for (const k in hc.styles.variables) root.style.setProperty(k, hc.styles.variables[k]);
+        }
+        if (hc.theme) {
+          // The host sends --color-* values as light-dark(light, dark). Those
+          // only resolve to the dark side when this document's color-scheme is
+          // dark, so mirror the host's resolved theme onto the guest document
+          // (initial context AND live theme switches).
+          document.documentElement.style.colorScheme = hc.theme;
+          const meta = document.getElementById("metaScheme");
+          if (meta) meta.setAttribute("content", hc.theme);
+          document.body.dataset.theme = hc.theme;
+        }
+        // Display mode: apply mode-specific CSS, then re-report the size that
+        // belongs to the new mode (stale sizes are what left the PiP mode with
+        // a scrollbar + whitespace after fullscreen).
+        if (this._setDisplayMode(hc.displayMode)) {
+          setTimeout(() => this.reportSize(), 60);
+        }
+      }
+
+      async init() {
+        const result = await this.request("ui/initialize", {
+          appInfo: { name: "token-context", version: "1.4.2" },
+          clientInfo: { name: "Token Context", version: "1.4.2" },
+          appCapabilities: {
+            availableDisplayModes: ["inline", "pip", "fullscreen"],
+          },
+          protocolVersion: "2026-01-26",
+        });
+        this.initialized = true;
+        if (result && result.hostContext) this._applyHostContext(result.hostContext);
+        if (!this.displayMode) this.displayMode = "inline";
+        this.notify("ui/notifications/initialized", {});
+        this.reportSize();
+        // Claim this session's popped-out slot BEFORE requesting pip
+        // (v1.4.0). Goose re-renders every app card from history — e.g. on
+        // a theme switch — and each remounted guest used to pop its own
+        // PiP window. With the claim, at most one HUD per session pops
+        // out; siblings render a compact placeholder until the popped HUD
+        // closes (the slot then transfers to a waiting instance).
+        let claimState = null;
+        try {
+          const claim = await this.callTool("hud_claim", { instance_id: INSTANCE_ID });
+          if (claim && claim.ok === true)
+            claimState = claim.pipClaim === "granted" ? "granted" : "denied";
+        } catch (_) {
+          /* older server without hud_claim: fail open (legacy behavior) */
+        }
+        if (claimState === "denied") {
+          setPipClaim("denied");
+        } else {
+          // Dock the HUD just above the chat input (pinned, draggable PiP).
+          try {
+            await this.request("ui/request-display-mode", { mode: "pip" });
+          } catch (_) {
+            /* host may not support pip; stay inline */
+          }
+          if (claimState === "granted") setPipClaim("granted");
+        }
+      }
+
+      /**
+       * Report the size that belongs to the current display mode:
+       *  - inline: natural content height (body is height:auto there), so the
+       *    host's inline iframe hugs the content.
+       *  - pip/fullscreen: the host frame is a fixed size; fill it minus a
+       *    few pixels (container border) so the iframe never overflows and
+       *    triggers a scrollbar / gray whitespace.
+       */
+      reportSize() {
+        const mode = this.displayMode || "inline";
+        let w = 0;
+        let h;
+        if (mode === "inline") {
+          h = document.body.scrollHeight;
+        } else {
+          const cd = this.hostContext && this.hostContext.containerDimensions;
+          const cw = cd && typeof cd === "object" ? Math.floor(Number(cd.width) || 0) : 0;
+          const ch = cd && typeof cd === "object" ? Math.floor(Number(cd.height) || 0) : 0;
+          w = cw > 0 ? cw - 4 : mode === "pip" ? 396 : 0;
+          h = ch > 0 ? ch - 4 : mode === "pip" ? 296 : 0;
+          if (!w && !h) {
+            w = (typeof window !== "undefined" && window.innerWidth) || 800;
+            h = (typeof window !== "undefined" && window.innerHeight) || 600;
+          }
+        }
+        const key = w + "x" + h;
+        if (key === this._lastSize) return; // no-op repeats at 5 Hz
+        this._lastSize = key;
+        const params = { height: h };
+        if (w) params.width = w;
+        this.notify("ui/notifications/size-changed", params);
+      }
+
+      async callTool(name, args) {
+        const res = await this.request("tools/call", { name, arguments: args || {} });
+        if (!res) return null;
+        if (res.structuredContent) return res.structuredContent;
+        const c = (res.content || []).find((x) => x && x.type === "text");
+        if (!c) return null;
+        try { return JSON.parse(c.text); } catch (_) { return null; }
+      }
+    }
+
+    // ---------------------------------------------------------------------
+    // HUD logic
+    // ---------------------------------------------------------------------
+    const app = new McpAppClient();
+
+    // Unique per window load — identifies this HUD instance to the server's
+    // pop-out claim (v1.4.0: one popped-out HUD per session).
+    const INSTANCE_ID =
+      "i" + Math.random().toString(36).slice(2, 10) + "-" + Date.now().toString(36);
+
+    const $ = (id) => document.getElementById(id);
+    // Bar color thresholds (% of context used) — dynamic: the server sends
+    // warnPct/dangerPct with every stats response, derived from the
+    // session's auto-compaction point (GOOSE_AUTO_COMPACT_THRESHOLD; red
+    // sits exactly on it, yellow at 80 % of red). The defaults match
+    // goose's defaults (80 % / 64 %) and hold until the first response.
+    // Single source of truth: the render() toggles and the marker
+    // positions (zones + ticks) both derive from these, so the marks
+    // always sit exactly on the color-change boundaries.
+    let WARN_PCT = 64, DANGER_PCT = 80;
+    const els = {
+      hud: $("hud"), dup: $("dup"),
+      dot: $("dot"), model: $("model"), tpsRow: $("tpsRow"),
+      ctxNum: $("ctxNum"), bar: $("bar"), fill: $("fill"), pct: $("pct"),
+      fIn: $("fIn"), fOut: $("fOut"), fCache: $("fCache"), fTotal: $("fTotal"),
+      zoneWarn: $("zoneWarn"), zoneDanger: $("zoneDanger"),
+      tickWarn: $("tickWarn"), tickDanger: $("tickDanger"),
+    };
+
+    // Pop-out slot state (v1.4.2): null = unknown (claim pending/failed),
+    // "granted" = this instance is THE popped-out HUD for the session →
+    // full HUD, "denied" = a sibling is the holder → compact placeholder.
+    // The display state is re-applied on every stats poll (a displaced
+    // holder degrades to the placeholder when a newer HUD takes over), but
+    // the pip REQUEST happens only at self-initialization — a guest never
+    // pops out after boot.
+    let pipClaim = null;
+    function setPipClaim(state) {
+      if ((state !== "granted" && state !== "denied") || state === pipClaim) return;
+      const prev = pipClaim;
+      pipClaim = state;
+      const denied = state === "denied";
+      els.hud.style.display = denied ? "none" : "";
+      els.dup.style.display = denied ? "" : "none";
+      if (denied && prev === "granted") {
+        // A newer HUD took the popped-out slot: if our window is still
+        // popped out, return it to inline (best-effort; host may decline).
+        app.request("ui/request-display-mode", { mode: "inline" }).catch(() => {});
+      }
+      app.reportSize();
+    }
+    // Position the threshold markers (re-runs when the server reports a
+    // different compaction point for the session).
+    function positionMarkers() {
+      els.zoneWarn.style.left = WARN_PCT + "%";
+      els.zoneWarn.style.right = (100 - DANGER_PCT) + "%";
+      els.zoneDanger.style.left = DANGER_PCT + "%";
+      els.zoneDanger.style.right = "0%";
+      els.tickWarn.style.left = WARN_PCT + "%";
+      els.tickDanger.style.left = DANGER_PCT + "%";
+      els.bar.title =
+        "warns at " + WARN_PCT + "% · auto-compaction at " + DANGER_PCT + "%";
+    }
+    positionMarkers();
+
+    function applyThresholds(stats) {
+      const w = Number(stats.warnPct), d = Number(stats.dangerPct);
+      if (Number.isFinite(w) && Number.isFinite(d) && d > 0 && d <= 100 &&
+          w > 0 && w < d && (w !== WARN_PCT || d !== DANGER_PCT)) {
+        WARN_PCT = w;
+        DANGER_PCT = d;
+        positionMarkers();
+      }
+    }
+
+    function fmtTok(n) {
+      if (n === null || n === undefined || Number.isNaN(n)) return "–";
+      if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + "M";
+      if (n >= 1_000) return (n / 1_000).toFixed(1) + "k";
+      return String(Math.round(n));
+    }
+
+    function render(stats) {
+      if (!stats) {
+        els.tpsRow.innerHTML = '<span class="tps-idle">no data</span>';
+        return;
+      }
+      if (stats.ok === false) {
+        els.tpsRow.innerHTML = '<span class="err">' + (stats.error || "error") + "</span>";
+        return;
+      }
+      if (stats.empty) {
+        els.tpsRow.innerHTML = '<span class="tps-idle">no active session</span>';
+        return;
+      }
+
+      // TPS — live while streaming (from the model server's /slots),
+      // otherwise the last completed response's rate.
+      const live = !!(stats.live && stats.live.active);
+      if (live) {
+        els.dot.classList.add("on");
+        els.tpsRow.innerHTML =
+          '<span class="tps-value">' + (stats.tps > 0 ? stats.tps.toFixed(1) : "0.0") + "</span>" +
+          '<span class="tps-unit">tok/s</span>' +
+          '<span class="tps-tag">' + (stats.live.phase === "prompt" ? "warming" : "live") + "</span>";
+      } else {
+        els.dot.classList.remove("on");
+        const isLast = stats.tpsMode === "last" && stats.tps > 0;
+        els.tpsRow.innerHTML =
+          '<span class="tps-value" style="color:var(--hud-text-tertiary)">' +
+          (isLast ? stats.tps.toFixed(1) : "0.0") + "</span>" +
+          '<span class="tps-unit" style="color:var(--hud-text-tertiary)">tok/s</span>' +
+          (isLast ? '<span class="tps-tag">last</span>' : "");
+      }
+
+      // Context bar — during a live stream we pre-fetch the true context
+      // size (measured prompt tokens + decoded so far), so the bar climbs
+      // in real time; when the response completes the DB value snaps in.
+      const used = stats.used || 0;
+      const win = stats.contextWindow || 0;
+      const displayUsed = live
+        ? Math.max(used, (stats.live.promptTokens || 0) + (stats.live.estOut || 0))
+        : used;
+      const pct = win > 0 ? Math.min(100, (displayUsed / win) * 100) : 0;
+      els.ctxNum.innerHTML =
+        (live ? "~" : "") + "<b>" + fmtTok(displayUsed) + "</b> / " + fmtTok(win) + " tokens";
+      applyThresholds(stats);
+      els.fill.style.width = pct.toFixed(1) + "%";
+      els.bar.classList.toggle("ok", pct < WARN_PCT);
+      els.bar.classList.toggle("warn", pct >= WARN_PCT && pct < DANGER_PCT);
+      els.bar.classList.toggle("danger", pct >= DANGER_PCT);
+      els.pct.textContent = pct.toFixed(1) + "% of context" + (live ? " (est)" : "");
+
+      // Model + footer
+      els.model.textContent = stats.model || "";
+      els.model.title = (stats.provider ? stats.provider + " · " : "") + (stats.model || "");
+      els.fIn.textContent = fmtTok(stats.input);
+      els.fOut.textContent = fmtTok(stats.output);
+      els.fCache.textContent = fmtTok(stats.cacheRead);
+      els.fTotal.textContent = fmtTok(stats.sessionTotal);
+
+      app.reportSize();
+    }
+
+    let polling = false;
+    async function tick() {
+      if (polling || !app.initialized) return;
+      polling = true;
+      try {
+        const stats = await app.callTool("get_context_stats", {
+          instance_id: INSTANCE_ID,
+        });
+        setPipClaim(stats && stats.pipClaim); // display state = current holder (v1.4.2)
+        render(stats);
+      } catch (e) {
+        // transient; keep last known values
+      } finally {
+        polling = false;
+      }
+    }
+
+    (async () => {
+      try {
+        await app.init();
+      } catch (e) {
+        els.tpsRow.innerHTML = '<span class="err">init failed: ' + e.message + "</span>";
+        return;
+      }
+      tick();
+      setInterval(tick, 200); // 5 updates per second
+    })();
+  </script>
+</body>
+</html>
