@@ -1,19 +1,16 @@
 # Token Context
-
 **Watch your goose session spend tokens in real time — pinned above the chat input, not buried in a footer.**
 
-Token Context is a small [goose MCP App](https://goose-docs.ai/docs/tutorials/building-mcp-apps) that pins a compact HUD into your chat's Picture-in-Picture slot, docked just above the input box, and refreshes it **5 times per second**: how fast your model is generating right now, how full your context window is (with the auto-compaction point marked on the bar), and where all the tokens went (input / output / cache-read). It reads goose's own session store **read-only**, re-skins itself to match your light/dark theme, and keeps exactly **one** popped-out HUD per session — even across re-triggers and theme switches.
+Token Context is a small [goose MCP App](https://goose-docs.ai/docs/tutorials/building-mcp-apps) that pins a compact HUD into your chat's Picture-in-Picture slot, docked just above the input box displaying
+- Realtime LLM Tokens generated per second.
+- Context window usage, limits, and compaction threshold.
+- Aggregrated input, cached, and output tokens for the entire session
+It automatically updates metrics **5 times per second**, responds to theme switches, remembers if it was open between relaunches, and is all controlled by a single slash command!
+
 
 ## Screenshots
-
-<!-- Drop your images in docs/ and uncomment:
-
 ![HUD popped out in PiP, docked above the chat input](docs/hud-pip.png)
-![Inline placeholder left behind by the previous HUD](docs/hud-placeholder.png)
 ![Re-trigger + theme flip — always exactly one popped-out window](docs/hud-demo.gif)
--->
-
-*Images coming soon — see [docs/](docs/README.md) for what's being captured.*
 
 ## What it shows
 
@@ -185,6 +182,10 @@ flowchart LR
 - **The PiP frame is a fixed 400×300 on the goose side**; the HUD fills it cleanly rather than floating with margins.
 
 ## Further reading
-- [CHANGELOG.md](CHANGELOG.md) — version history
-- [DEVELOPMENT.md](DEVELOPMENT.md) — testing and reloading the extension after code changes
+- [CHANGELOG.md](docs/CHANGELOG.md) — version history
+- [DEVELOPMENT.md](docs/DEVELOPMENT.md) — testing and reloading the extension after code changes
 - [Building MCP Apps (goose docs)](https://goose-docs.ai/docs/tutorials/building-mcp-apps)
+
+
+## Credits
+Vibed with love by unsloth/Qwen3.8-27B[UD-Q4_K_XL]
