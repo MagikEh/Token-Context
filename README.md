@@ -14,7 +14,7 @@ It automatically updates metrics **5 times per second**, responds to theme switc
 
 ## What it shows
 
-- **tok/s** — rolling output-token rate over the last 30 s of completed responses. For local llama.cpp servers it's a *live* per-token feed from the model server's own `/slots` counter, with a streaming dot while a response is in flight. States: `live` (decoding) → `warming` (prompt phase) → `last` (idle, last completed response) → 30 s rolling fallback.
+- **tok/s** — rolling output-token rate over the last 30 s of completed responses. For local llama.cpp servers it's a *live* per-token feed from the model server's own `/slots` counter (single-model *and* router mode — the router's per-model endpoint is picked up automatically), with a streaming dot while a response is in flight. States: `live` (decoding) → `warming` (prompt phase) → `last` (idle, last completed response) → 30 s rolling fallback.
 - **used / window** — the active session's current context size (e.g. `31,994 / 200,000`) with a color-coded progress bar: green below the warn trigger, amber between the triggers, red at/above the auto-compaction point. The bar carries 1 px ticks at both triggers and zone tints on the empty track, so the colour-change points stay visible as it fills.
 - **footer** — input / output / cache-read tokens and the session's accumulated total.
 
@@ -90,7 +90,7 @@ Set any of these in the extension's environment (UI modal or `envs:` in `config.
 | `GOOSE_SESSIONS_DB`           | auto-discovered (`~/.local/share/goose/sessions/sessions.db`)                         | Explicit path to the goose session store.
 | `GOOSE_CUSTOM_PROVIDERS_DIR`  | `~/.config/goose/custom_providers`                                                    | Where custom provider JSON files live (context-window lookup by provider + model).
 | `GOOSE_CONFIG_PATH`           | `~/.config/goose/config.yaml`                                                         | goose config file — used to read `GOOSE_AUTO_COMPACT_THRESHOLD` and local-model context sizes.
-| `GOOSE_SLOTS_URL`             | derived from the custom provider's `base_url` (`""` disables)                         | llama.cpp `/slots` endpoint for the live per-token tok/s feed.
+| `GOOSE_SLOTS_URL`             | derived from the custom provider's `base_url` (`""` disables)                         | llama.cpp `/slots` endpoint for the live per-token tok/s feed. Router-mode servers (`--models-preset`) are detected automatically and answered per-model (`?model=<session model>`).
 | `GOOSE_SLOT_POLL_MS`          | 100                                                                                   | `/slots` poll cadence (ms) while no slot is processing.
 | `GOOSE_SLOT_ACTIVE_POLL_MS`   | 50 (capped at the idle cadence)                                                       | `/slots` poll cadence (ms) while a slot is decoding.
 | `GOOSE_TPS_OFFSET_MS`         | 0                                                                                     | Constant (ms) added to the hand-off duration when computing the idle **last** rate — calibrates the HUD to goose's footer timer, which includes client-side overhead the model-server window doesn't (≈120 measured on one local llama.cpp setup).
@@ -136,7 +136,7 @@ Behaviour worth knowing:
 
 - `sessions.total_tokens` — the authoritative *used* figure for the tracked session (written by goose at response-completion boundaries).
 - `usage_ledger` — one row per completed LLM response; source of the rolling tok/s and the idle **last** rate.
-- A live monitor that polls a local llama.cpp server's `/slots` endpoint adaptively (50 ms while a slot is decoding, 100 ms idle), turning the model server's own `n_decoded` counter into a real-time tok/s plus a pre-fetched context estimate. At the idle boundary it hands the final decoded count and millisecond-resolution elapsed time over to the ledger, so the idle rate matches goose's footer timer closely (`stats.lastSource` reports `handoff` vs `db`).
+- A live monitor that polls a local llama.cpp server's `/slots` endpoint adaptively (50 ms while a slot is decoding, 100 ms idle), turning the model server's own `n_decoded` counter into a real-time tok/s plus a pre-fetched context estimate. It serves both single-model servers (bare `GET /slots`) and router mode (`--models-preset`, one port for many models): a router's refusal of the bare request (HTTP 400 "model name is missing") is detected on the first poll, after which the request carries the tracked session's model (`GET /slots?model=<name>`, refreshed on every stats call). At the idle boundary it hands the final decoded count and millisecond-resolution elapsed time over to the ledger, so the idle rate matches goose's footer timer closely (`stats.lastSource` reports `handoff` vs `db`).
 
 It also hosts the **claim broker**: an in-memory singleton per session that arbitrates who may hold the popped-out state. Guests call `hud_claim` with a per-load `instance_id`; the broker grants the slot if unheld, takes it over once a holder's claim ages past the takeover window, denies rapid successive claims (the theme-switch remount cascade), and expires dead holders by TTL.
 
@@ -157,11 +157,11 @@ flowchart LR
   subgraph ext["token-context server.js — stdio, one process per session"]
     CLAIM["Claim broker<br/>singleton popped-out slot<br/>(TTL + takeover + cascade guard)"]
     STATS["Stats engine<br/>sessions.total_tokens<br/>usage_ledger"]
-    MON["Live /slots monitor<br/>50 ms decoding / 100 ms idle"]
+    MON["Live /slots monitor<br/>50 ms decoding / 100 ms idle<br/>(single-model + router mode)"]
   end
 
   DB[("sessions.db<br/>read-only, WAL")]
-  LLM["llama.cpp server<br/>(optional, local only)"]
+  LLM["llama.cpp server<br/>single-model or router mode<br/>(optional, local only)"]
 
   UI -- "recipe mounts the ui:// resource" --> GUEST
   GUEST -- "1. ui/initialize" --> ext
@@ -170,12 +170,12 @@ flowchart LR
   GUEST -- "3. request-display-mode pip (only if granted)" --> PIP
   GUEST -- "4. poll get_context_stats @ 5 Hz" --> STATS
   STATS -- "SQL" --> DB
-  MON -- "GET /slots" --> LLM
+  MON -- "GET /slots (?model= in router mode)" --> LLM
   MON -- "live rate + pre-fetch estimate" --> STATS
 ```
 
 ### Limitations
-- **tok/s granularity for remote providers.** goose writes `sessions.db` only at response-completion boundaries, so for API providers the HUD shows the last completed response's rate (tagged `last`) while idle. Local llama.cpp servers get a genuine live feed via `/slots` — but the slot is per-server, not per-session (goose's background calls light it up too), so the live estimate is only trusted while the slot's measured prompt size correlates with the tracked session's context size (±25 %, min 8 k tokens); at completion the authoritative DB value snaps back in.
+- **tok/s granularity for remote providers.** goose writes `sessions.db` only at response-completion boundaries, so for API providers the HUD shows the last completed response's rate (tagged `last`) while idle. Local llama.cpp servers get a genuine live feed via `/slots` — both single-model servers and router mode (`--models-preset`, where the monitor follows the session's model via `?model=`) — but the slot is per-server (per-model in router mode), not per-session (goose's background calls light it up too), so the live estimate is only trusted while the slot's measured prompt size correlates with the tracked session's context size (±25 %, min 8 k tokens); at completion the authoritative DB value snaps back in.
 - **PiP placeholder.** While the HUD is popped out, goose shows a small "Playing in Picture-in-Picture" placeholder in the chat flow at the spot where the HUD would have been inline. That's the closest built-in way to pin the panel above the input without modifying goose.
 - **Context window for custom providers is an estimate** unless you set `GOOSE_CONTEXT_WINDOW`.
 - **The HUD tracks the most recently updated user session** — in practice the active one.

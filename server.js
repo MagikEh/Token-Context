@@ -55,7 +55,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const APP_HTML = readFileSync(join(__dirname, "index.html"), "utf-8");
 const RESOURCE_URI = "ui://token-context/hud";
 const SERVER_NAME = "token-context";
-const SERVER_VERSION = "1.4.2";
+const SERVER_VERSION = "1.4.3";
 
 // ---------------------------------------------------------------------------
 // SQLite access (read-only). Uses the built-in `node:sqlite` (Node >= 22.5).
@@ -497,6 +497,7 @@ function computeStats(explicitSessionId) {
       const barTh = resolveBarThresholds();
       const rolling = rollingTps(db, s.id);
       setSlotsUrlForProvider(s.provider_name);
+      setSlotsModel(s.model);
       const live = liveEstimate(used);
       const last = lastResponseTps(db, s.id);
       const lastTps = last.tps;
@@ -548,6 +549,14 @@ function computeStats(explicitSessionId) {
 // background and report a live "pre-fetched" estimate; when the response
 // completes, the DB value becomes authoritative again (the estimate simply
 // stops being reported).
+//
+// Two server shapes are supported:
+//   * single-model llama-server — bare GET /slots answers with the slot array.
+//   * router mode (--models-preset, one port serving many models) — a bare
+//     GET /slots is refused with HTTP 400 "model name is missing"; slot state
+//     is per-model at GET /slots?model=<name>. That refusal is detected on
+//     the first poll, and from then on the tracked session's model name (from
+//     sessions.db, refreshed on every stats call) is appended to the URL.
 // ---------------------------------------------------------------------------
 // Adaptive cadence: while a slot is decoding we want the tightest wall-clock
 // measurement possible (it bounds the completion hand-off's duration error —
@@ -563,6 +572,8 @@ const ACTIVE_POLL_MS = Math.min(
 );
 export const slotMonitor = {
   url: process.env.GOOSE_SLOTS_URL || null, // fixed override (tests)
+  model: "",    // tracked session's model name (scopes /slots in router mode)
+  router: false, // true once the endpoint proved to be a model ROUTER
   state: null,
   fetchedAt: 0,
   failures: 0,
@@ -587,21 +598,80 @@ function setSlotsUrlForProvider(provider) {
   }
 }
 
+// In router mode the tracked session's model scopes the /slots request
+// (GET /slots?model=<name>); single-model servers answer bare /slots and
+// the parameter is never appended.
+function slotsUrlNow() {
+  const base = slotMonitor.url;
+  if (!base || !slotMonitor.router || !slotMonitor.model) return base;
+  try {
+    const u = new URL(base);
+    u.searchParams.set("model", slotMonitor.model);
+    return u.toString();
+  } catch {
+    return base;
+  }
+}
+
+// The tracked session's model name, refreshed on every stats call. A change
+// discards the previous model's decode samples so its hand-off cannot be
+// attributed to this session (the slot is per-model, not per-session).
+export function setSlotsModel(model) {
+  const m = typeof model === "string" ? model.trim() : "";
+  if (m === slotMonitor.model) return;
+  slotMonitor.model = m;
+  slotMonitor.state = null;
+  slotMonitor.fetchedAt = 0;
+  slotMonitor.samples = [];
+  slotMonitor.startAt = null;
+  slotMonitor.wasProc = false;
+  slotMonitor.promptTokens = 0;
+}
+
 async function pollSlots() {
   if (!slotMonitor.url) return false;
+  const url = slotsUrlNow();
+  const hadModel = slotMonitor.router && !!slotMonitor.model;
   try {
     const ctrl = new AbortController();
     const to = setTimeout(() => ctrl.abort(), 200);
-    const r = await fetch(slotMonitor.url, { signal: ctrl.signal });
+    const r = await fetch(url, { signal: ctrl.signal });
     clearTimeout(to);
-    if (!r.ok) throw new Error("http " + r.status);
-    slotMonitor.state = await r.json();
-    slotMonitor.fetchedAt = Date.now();
-    slotMonitor.failures = 0;
-    return true;
+    const body = await r.json().catch(() => null);
+    if (body === null) throw new Error("http " + r.status);
+    if (Array.isArray(body)) {
+      // A bare /slots answering with a plain array means we are NOT talking
+      // to a router after all (single-model server) — drop the flag.
+      if (slotMonitor.router && !hadModel) slotMonitor.router = false;
+      slotMonitor.state = body;
+      slotMonitor.fetchedAt = Date.now();
+      slotMonitor.failures = 0;
+      return true;
+    }
+    // A single-model llama-server always answers /slots with an array, so a
+    // JSON object here (the router's HTTP 400 "model name is missing") means
+    // we are talking to a model ROUTER: mark it and retry once, this time
+    // with the tracked session's model name.
+    if (!slotMonitor.router) {
+      slotMonitor.router = true;
+      console.error(
+        `[token-context] /slots is router-mode (per-model); tracking "${
+          slotMonitor.model || "(unknown model — waiting for a stats call)"
+        }"`
+      );
+      if (slotMonitor.model) return pollSlots();
+      return false; // model arrives with the next stats call
+    }
+    // Router mode, model-scoped request came back empty — the model is
+    // probably unloaded (or the router is momentarily wedged). Nothing to
+    // observe right now; not counted as a fetch failure.
+    return false;
   } catch {
     slotMonitor.failures++;
-    if (slotMonitor.failures > 60) slotMonitor.url = null; // give up, re-derived on next stats call
+    if (slotMonitor.failures > 60) {
+      slotMonitor.url = null;
+      slotMonitor.router = false; // re-derived + re-detected on next stats call
+    }
     return false;
   }
 }

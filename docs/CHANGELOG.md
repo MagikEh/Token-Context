@@ -2,6 +2,19 @@
 
 All notable changes to Token Context. The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.4.3] — 2026-10-13
+
+### Fixed — live tok/s for llama.cpp in router mode (`--models-preset`)
+
+Router mode — one `llama-server` port serving many models, loaded on demand — broke the live tok/s feed: a router refuses a bare `GET /slots` with HTTP 400 `"model name is missing"`, and per-model state lives at `GET /slots?model=<name>`. The monitor treated the 400 as a plain fetch failure, so it never saw a processing slot and the HUD stayed on the `last` (completed-response) rate.
+
+- **Router detection**: a single-model llama-server always answers `/slots` with an array, so a JSON object response marks a model ROUTER — detected on the first poll, logged once to stderr.
+- **Model-scoped polling**: from then on the request carries the tracked session's model (`/slots?model=<name>`), refreshed on every stats call; switching sessions/models discards the previous model's decode samples so its hand-off can't be attributed to the wrong session.
+- **Graceful degradation**: a model-scoped request that comes back empty (model currently unloaded, router momentarily wedged) is not counted as a fetch failure; a session with no model name simply falls back to the idle feed.
+- **Single-model servers unchanged**: the bare endpoint is still used as before, and a bare `/slots` that answers with a plain array clears the router flag if it was ever set.
+
+Verified: full suite green (new Part G covers single-mode regression, router detection, model switching, unknown-model degradation) plus a live probe against a real 5-model router showing `n_decoded` incrementing per poll during a decode.
+
 ## [1.4.2] — 2026-09-28
 
 ### Changed — the popped-out state is a singleton, not the HUD itself

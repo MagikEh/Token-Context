@@ -5,6 +5,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import http from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -522,6 +523,162 @@ const fDbPath = join(ftmp, "sessions.db");
 }
 
 rmSync(ftmp, { recursive: true, force: true });
+
+// ---------------------------------------------------------------------------
+// Part G: /slots monitor against single-model and ROUTER-mode servers (v1.4.3)
+//
+// A router-mode llama-server (--models-preset) refuses a bare GET /slots with
+// HTTP 400 "model name is missing"; per-model state lives at
+// GET /slots?model=<name>. The monitor must detect that refusal and follow
+// the tracked session's model, while single-model servers keep working via
+// the bare endpoint. Each scenario gets a FRESH server process (the monitor
+// is per-process state), driven entirely through MCP stats calls.
+// ---------------------------------------------------------------------------
+console.log("\n=== Part G: slots monitor — single + router mode (v1.4.3) ===");
+{
+  const gtmp = mkdtempSync(join(tmpdir(), "ctx-hudG-"));
+
+  // Mock llama.cpp endpoint.
+  //   mode "single": bare /slots (model param ignored) → 200 slot array.
+  //   mode "router": bare /slots → 400 "model name is missing" (the real
+  //                  router's refusal); /slots?model=<name> → 200 array for
+  //                  a loaded model, 404 for an unknown one.
+  const slots = new Map(); // key "*" (single) or model name → state
+  let mockMode = "single";
+  const mock = http.createServer((req, res) => {
+    const u = new URL(req.url, "http://127.0.0.1");
+    if (!u.pathname.endsWith("/slots")) {
+      res.writeHead(404); res.end(); return;
+    }
+    const model = u.searchParams.get("model");
+    if (mockMode === "router" && !model) {
+      res.writeHead(400);
+      res.end(JSON.stringify({
+        error: { code: 400, message: "model name is missing from the request", type: "invalid_request_error" },
+      }));
+      return;
+    }
+    const s = (mockMode === "router" ? slots.get(model) : slots.get("*")) || null;
+    if (!s) {
+      res.writeHead(404);
+      res.end(JSON.stringify({ error: { message: "model not loaded" } }));
+      return;
+    }
+    res.writeHead(200);
+    res.end(JSON.stringify([{
+      id: 0, is_processing: s.processing, n_prompt_tokens: s.prompt,
+      next_token: s.processing ? [{ n_decoded: s.n_decoded }] : [],
+    }]));
+  });
+  await new Promise((r) => mock.listen(0, "127.0.0.1", r));
+  const port = mock.address().port;
+
+  // Fixture: two sessions on one provider (models model-a / model-b) + one
+  // with an empty model name (G4).
+  const gcp = join(gtmp, "custom_providers");
+  mkdirSync(gcp);
+  writeFileSync(join(gcp, "gp.json"), JSON.stringify({
+    name: "gp",
+    engine: "openai",
+    base_url: `http://127.0.0.1:${port}/v1`,
+    models: [
+      { name: "model-a", context_limit: 100000 },
+      { name: "model-b", context_limit: 200000 },
+    ],
+  }));
+  const gdb = join(gtmp, "sessions.db");
+  {
+    const db = new DatabaseSync(gdb);
+    db.exec(`
+      CREATE TABLE sessions (
+        id TEXT PRIMARY KEY, name TEXT, session_type TEXT,
+        provider_name TEXT, model_config_json TEXT,
+        total_tokens INTEGER, input_tokens INTEGER, output_tokens INTEGER,
+        cache_read_tokens INTEGER, accumulated_total_tokens INTEGER,
+        updated_at INTEGER
+      );
+      CREATE TABLE usage_ledger (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT, created_timestamp INTEGER,
+        input_tokens INTEGER, output_tokens INTEGER
+      );
+    `);
+    const ins = db.prepare(`INSERT INTO sessions
+      (id, name, session_type, provider_name, model_config_json,
+       total_tokens, input_tokens, output_tokens, cache_read_tokens,
+       accumulated_total_tokens, updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)`);
+    const gnow = Date.now();
+    ins.run("gsess-a", "Router A", "user", "gp", JSON.stringify({ model_name: "model-a" }),
+      10000, 9000, 1000, 8000, 100000, gnow - 3000);
+    ins.run("gsess-b", "Router B", "user", "gp", JSON.stringify({ model_name: "model-b" }),
+      20000, 18000, 2000, 15000, 200000, gnow - 2000);
+    ins.run("gsess-c", "No Model", "user", "gp", JSON.stringify({}),
+      5000, 4000, 1000, 3000, 50000, gnow - 1000);
+    db.close();
+  }
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const mkClient = () => connectServer({ GOOSE_SESSIONS_DB: gdb, GOOSE_CUSTOM_PROVIDERS_DIR: gcp });
+  const stats = async (c, sessionId) => {
+    const r = await c.callTool({ name: "get_context_stats", arguments: { session_id: sessionId } });
+    return r.structuredContent ?? JSON.parse(r.content[0].text);
+  };
+
+  // G1: single-model mode — bare /slots, no model param (regression guard).
+  mockMode = "single";
+  slots.set("*", { processing: true, n_decoded: 0, prompt: 9500 });
+  const iv = setInterval(() => {
+    for (const s of slots.values()) if (s.processing) s.n_decoded += 5;
+  }, 40);
+  {
+    const c = await mkClient();
+    await stats(c, "gsess-a"); // arms the monitor (url + model)
+    await sleep(800);          // let it sample the decode
+    const r = await stats(c, "gsess-a");
+    check("G1 single: live tok/s from bare /slots (tpsMode live, estTps > 0)",
+      r.tpsMode === "live" && r.live.active === true && r.live.estTps > 0);
+    check("G1 single: pre-fetched estimate tracks the mock counter (estOut > 0)",
+      r.live.estOut > 0 && r.live.phase === "decode");
+    await c.close();
+  }
+
+  // G2: router mode — bare /slots 400s; monitor detects and follows ?model=.
+  mockMode = "router";
+  slots.clear();
+  slots.set("model-a", { processing: true, n_decoded: 0, prompt: 9500 });
+  slots.set("model-b", { processing: false, n_decoded: 0, prompt: 19500 });
+  {
+    const c = await mkClient();
+    await stats(c, "gsess-a"); // arms: first poll → 400 → router detected → ?model=
+    await sleep(800);
+    let r = await stats(c, "gsess-a");
+    check("G2 router: detected + live tok/s via /slots?model= (tpsMode live)",
+      r.tpsMode === "live" && r.live.active === true && r.live.estTps > 0);
+
+    // G3: model switch — model-b is idle; model-a's decode must not leak in.
+    r = await stats(c, "gsess-b");
+    check("G3 switch: idle model-b reports no live feed (no cross-model leak)",
+      r.live.active === false && r.tpsMode !== "live");
+    await stats(c, "gsess-a"); // switch back (resets samples)
+    await sleep(500);          // re-sample model-a's slot
+    r = await stats(c, "gsess-a");
+    check("G3 switch: back on gsess-a the live feed is active again",
+      r.tpsMode === "live" && r.live.active === true && r.live.estTps > 0);
+
+    // G4: unknown model (empty model_name) in router mode — degrades to the
+    // idle feed cleanly (bare /slots keeps 400ing; no state, no crash).
+    r = await stats(c, "gsess-c");
+    check("G4 unknown model: router + empty model degrades (no live, ok response)",
+      r.ok === true && r.live.active === false && r.tpsMode !== "live");
+    await c.close();
+  }
+
+  clearInterval(iv);
+  await new Promise((r) => mock.close(r));
+  rmSync(gtmp, { recursive: true, force: true });
+}
+
 if (fails.length) {
   console.error("\nFAILURES:", fails);
   process.exit(1);

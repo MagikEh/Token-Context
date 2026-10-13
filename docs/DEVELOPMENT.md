@@ -19,6 +19,7 @@ node test-hud-client.mjs       # HUD guest-script functional test (stub DOM + fa
 - `get_context_stats` output shape against the live `sessions.db`,
 - the `ui://token-context/hud` resource (mimeType `text/html;profile=mcp-app`, CSP),
 - **Part F: the claim protocol** — grant, deny-while-held, takeover after the claim ages past `GOOSE_HUD_CLAIM_TAKEOVER_MS`, rapid-successive-claim denial, TTL expiry, poll-only-observation (`pipClaim` reports never change the holder), and the displaced-holder path (11/11).
+- **Part G: the /slots monitor against mock single-model and router-mode servers** — live tok/s from a bare `/slots` (single-model regression), router detection from the 400 "model name is missing" refusal and follow-through to `/slots?model=<name>`, model-switch isolation (one model's decode never leaks into another session's live feed), and clean degradation for a session with no model name.
 
 **`test-hud-client.mjs`** — loads the guest script from `index.html` into a stub DOM against a fake MCP App host and walks three end-to-end scenarios:
 
