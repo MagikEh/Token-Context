@@ -14,7 +14,7 @@ It automatically updates metrics **5 times per second**, responds to theme switc
 
 ## What it shows
 
-- **tok/s** — rolling output-token rate over the last 30 s of completed responses. For local llama.cpp servers it's a *live* per-token feed from the model server's own `/slots` counter (single-model *and* router mode — the router's per-model endpoint is picked up automatically), with a streaming dot while a response is in flight. States: `live` (decoding) → `warming` (prompt phase) → `last` (idle, last completed response) → 30 s rolling fallback.
+- **tok/s** — rolling output-token rate over the last 30 s of completed responses. For local llama.cpp servers it's a *live* per-token feed from the model server's own `/slots` counter (single-model *and* router mode — in router mode the session's per-model backend is discovered from the router's catalog and polled directly, so the router's per-request log stays clean), with a streaming dot while a response is in flight. States: `live` (decoding) → `warming` (prompt phase) → `last` (idle, last completed response) → 30 s rolling fallback.
 - **used / window** — the active session's current context size (e.g. `31,994 / 200,000`) with a color-coded progress bar: green below the warn trigger, amber between the triggers, red at/above the auto-compaction point. The bar carries 1 px ticks at both triggers and zone tints on the empty track, so the colour-change points stay visible as it fills.
 - **footer** — input / output / cache-read tokens and the session's accumulated total.
 
@@ -90,9 +90,12 @@ Set any of these in the extension's environment (UI modal or `envs:` in `config.
 | `GOOSE_SESSIONS_DB`           | auto-discovered (`~/.local/share/goose/sessions/sessions.db`)                         | Explicit path to the goose session store.
 | `GOOSE_CUSTOM_PROVIDERS_DIR`  | `~/.config/goose/custom_providers`                                                    | Where custom provider JSON files live (context-window lookup by provider + model).
 | `GOOSE_CONFIG_PATH`           | `~/.config/goose/config.yaml`                                                         | goose config file — used to read `GOOSE_AUTO_COMPACT_THRESHOLD` and local-model context sizes.
-| `GOOSE_SLOTS_URL`             | derived from the custom provider's `base_url` (`""` disables)                         | llama.cpp `/slots` endpoint for the live per-token tok/s feed. Router-mode servers (`--models-preset`) are detected automatically and answered per-model (`?model=<session model>`).
-| `GOOSE_SLOT_POLL_MS`          | 100                                                                                   | `/slots` poll cadence (ms) while no slot is processing.
+| `GOOSE_SLOTS_URL`             | derived from the custom provider's `base_url` (`""` disables)                         | llama.cpp `/slots` endpoint for the live per-token tok/s feed. Routers are detected automatically (per-model `?model=`); when the router advertises the backend port in `/v1/models`, the silent backend is polled directly instead.
+| `GOOSE_SLOT_POLL_MS`          | 100                                                                                   | `/slots` poll cadence (ms) while no slot is processing (and always, when a silent backend is being polled).
 | `GOOSE_SLOT_ACTIVE_POLL_MS`   | 50 (capped at the idle cadence)                                                       | `/slots` poll cadence (ms) while a slot is decoding.
+| `GOOSE_SLOT_SETTLE_MS`        | 10000                                                                                 | How long (ms) after a slot stops processing the 100 ms cadence is kept before dropping to the heartbeat — tight hand-off boundaries + tool-loop bursts.
+| `GOOSE_SLOT_HEARTBEAT_MS`     | 1000                                                                                  | `/slots` poll cadence (ms) after long quiet — a router logs one line per proxied request, so this bounds the idle log rate (~1 line/s on the router fallback path).
+| `GOOSE_SLOT_REVALIDATE_MS`    | 60000                                                                                 | How often (ms) the backend port is re-validated against the router's `/v1/models` catalog — LRU swaps and sleeping backends can leave a stale port behind.
 | `GOOSE_TPS_OFFSET_MS`         | 0                                                                                     | Constant (ms) added to the hand-off duration when computing the idle **last** rate — calibrates the HUD to goose's footer timer, which includes client-side overhead the model-server window doesn't (≈120 measured on one local llama.cpp setup).
 | `GOOSE_HUD_CLAIM_TTL_MS`      | 3000                                                                                  | Liveness TTL (ms) for the popped-out HUD slot.
 | `GOOSE_HUD_CLAIM_TAKEOVER_MS` | 10000                                                                                 | How old (ms) a holder's claim must be before a fresh HUD self-init takes over the popped-out slot.
@@ -136,7 +139,12 @@ Behaviour worth knowing:
 
 - `sessions.total_tokens` — the authoritative *used* figure for the tracked session (written by goose at response-completion boundaries).
 - `usage_ledger` — one row per completed LLM response; source of the rolling tok/s and the idle **last** rate.
-- A live monitor that polls a local llama.cpp server's `/slots` endpoint adaptively (50 ms while a slot is decoding, 100 ms idle), turning the model server's own `n_decoded` counter into a real-time tok/s plus a pre-fetched context estimate. It serves both single-model servers (bare `GET /slots`) and router mode (`--models-preset`, one port for many models): a router's refusal of the bare request (HTTP 400 "model name is missing") is detected on the first poll, after which the request carries the tracked session's model (`GET /slots?model=<name>`, refreshed on every stats call). At the idle boundary it hands the final decoded count and millisecond-resolution elapsed time over to the ledger, so the idle rate matches goose's footer timer closely (`stats.lastSource` reports `handoff` vs `db`).
+- A live monitor that polls a local llama.cpp server's `/slots` endpoint adaptively, turning the model server's own `n_decoded` counter into a real-time tok/s plus a pre-fetched context estimate. It serves three server shapes:
+  - **single-model** — bare `GET /slots` answers with the slot array.
+  - **router mode** (`--models-preset`, one port serving many models) — the router's refusal of the bare request (HTTP 400 "model name is missing") is detected on the first poll, after which the request carries the tracked session's model (`GET /slots?model=<name>`, refreshed on every stats call).
+  - **backend bypass** (router mode, when available) — the router logs one line per *proxied* request, so steady polling spams its log. The router-local `GET /v1/models` catalog advertises each loaded model's backend host/port (in `status.args`); once discovered, the monitor polls the backend's own `/slots` directly — silent, and free to keep the full cadence. The cache is re-validated every `GOOSE_SLOT_REVALIDATE_MS` (an evicted model's backend can stay alive-but-sleeping, so a stale port must not be trusted) and after 3 consecutive misses (LRU swap → new port).
+  
+  When the bypass isn't available (routers without a usable catalog), the router-endpoint cadence is tiered: 50 ms decoding → 100 ms for `GOOSE_SLOT_SETTLE_MS` after activity → a `GOOSE_SLOT_HEARTBEAT_MS` heartbeat until the next activity. At the idle boundary the monitor hands the final decoded count and millisecond-resolution elapsed time over to the ledger, so the idle rate matches goose's footer timer closely (`stats.lastSource` reports `handoff` vs `db`).
 
 It also hosts the **claim broker**: an in-memory singleton per session that arbitrates who may hold the popped-out state. Guests call `hud_claim` with a per-load `instance_id`; the broker grants the slot if unheld, takes it over once a holder's claim ages past the takeover window, denies rapid successive claims (the theme-switch remount cascade), and expires dead holders by TTL.
 
@@ -157,7 +165,7 @@ flowchart LR
   subgraph ext["token-context server.js — stdio, one process per session"]
     CLAIM["Claim broker<br/>singleton popped-out slot<br/>(TTL + takeover + cascade guard)"]
     STATS["Stats engine<br/>sessions.total_tokens<br/>usage_ledger"]
-    MON["Live /slots monitor<br/>50 ms decoding / 100 ms idle<br/>(single-model + router mode)"]
+    MON["Live /slots monitor<br/>50 ms decoding / 100 ms settling<br/>+ 1 s heartbeat (router fallback)"]
   end
 
   DB[("sessions.db<br/>read-only, WAL")]
@@ -170,12 +178,13 @@ flowchart LR
   GUEST -- "3. request-display-mode pip (only if granted)" --> PIP
   GUEST -- "4. poll get_context_stats @ 5 Hz" --> STATS
   STATS -- "SQL" --> DB
-  MON -- "GET /slots (?model= in router mode)" --> LLM
+  MON -- "GET /slots (?model= / direct backend)" --> LLM
+  MON -- "GET /v1/models (backend discovery)" --> LLM
   MON -- "live rate + pre-fetch estimate" --> STATS
 ```
 
 ### Limitations
-- **tok/s granularity for remote providers.** goose writes `sessions.db` only at response-completion boundaries, so for API providers the HUD shows the last completed response's rate (tagged `last`) while idle. Local llama.cpp servers get a genuine live feed via `/slots` — both single-model servers and router mode (`--models-preset`, where the monitor follows the session's model via `?model=`) — but the slot is per-server (per-model in router mode), not per-session (goose's background calls light it up too), so the live estimate is only trusted while the slot's measured prompt size correlates with the tracked session's context size (±25 %, min 8 k tokens); at completion the authoritative DB value snaps back in.
+- **tok/s granularity for remote providers.** goose writes `sessions.db` only at response-completion boundaries, so for API providers the HUD shows the last completed response's rate (tagged `last`) while idle. Local llama.cpp servers get a genuine live feed via `/slots` — single-model servers and router mode both (in router mode the session's per-model backend is polled directly when the router advertises its port, otherwise the router's `?model=` endpoint with a tiered cadence) — but the slot is per-server (per-model in router mode), not per-session (goose's background calls light it up too), so the live estimate is only trusted while the slot's measured prompt size correlates with the tracked session's context size (±25 %, min 8 k tokens); at completion the authoritative DB value snaps back in.
 - **PiP placeholder.** While the HUD is popped out, goose shows a small "Playing in Picture-in-Picture" placeholder in the chat flow at the spot where the HUD would have been inline. That's the closest built-in way to pin the panel above the input without modifying goose.
 - **Context window for custom providers is an estimate** unless you set `GOOSE_CONTEXT_WINDOW`.
 - **The HUD tracks the most recently updated user session** — in practice the active one.

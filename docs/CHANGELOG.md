@@ -13,6 +13,12 @@ Router mode — one `llama-server` port serving many models, loaded on demand �
 - **Graceful degradation**: a model-scoped request that comes back empty (model currently unloaded, router momentarily wedged) is not counted as a fetch failure; a session with no model name simply falls back to the idle feed.
 - **Single-model servers unchanged**: the bare endpoint is still used as before, and a bare `/slots` that answers with a plain array clears the router flag if it was ever set.
 
+### Changed — silent /slots polling (backend bypass + tiered cadence)
+
+A router logs one line per PROXIED request, so the steady 10 Hz poll spammed the server log 10 lines/s even while idle. The monitor now talks to the model's **backend directly**: the router's router-local `GET /v1/models` catalog advertises each loaded model's backend host/port (in `status.args`), and once discovered the poll targets the backend's own `/slots` — verified silent. Routers without a usable catalog keep working via the router endpoint, whose cadence is now tiered: 50 ms decoding → 100 ms for `GOOSE_SLOT_SETTLE_MS` (default 10 s) after activity → `GOOSE_SLOT_HEARTBEAT_MS` (default 1 s) until the next activity. The backend cache is re-validated every `GOOSE_SLOT_REVALIDATE_MS` (default 60 s) because an evicted model's backend can stay alive-but-sleeping (`--sleep-idle-seconds`) with a stale port, and after 3 consecutive misses (LRU swap → new port).
+
+Verified: full suite green (Part G now covers single-mode regression, router detection, catalog→URL extraction, the backend bypass, LRU-swap re-validation, and the measured settle→heartbeat cadence) plus live probes: the real router's `/v1/models` exposes the backend port, and direct backend `/slots` polls produced zero log lines.
+
 Verified: full suite green (new Part G covers single-mode regression, router detection, model switching, unknown-model degradation) plus a live probe against a real 5-model router showing `n_decoded` incrementing per poll during a decode.
 
 ## [1.4.2] — 2026-09-28

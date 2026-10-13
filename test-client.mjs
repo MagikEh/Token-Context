@@ -20,6 +20,7 @@ const {
   slotHandoff,
   slotStateTransition,
   resolveBarThresholds,
+  backendUrlFromCatalog,
 } = await import(SERVER);
 const fails = [];
 const check = (name, cond) => {
@@ -525,7 +526,8 @@ const fDbPath = join(ftmp, "sessions.db");
 rmSync(ftmp, { recursive: true, force: true });
 
 // ---------------------------------------------------------------------------
-// Part G: /slots monitor against single-model and ROUTER-mode servers (v1.4.3)
+// Part G: /slots monitor — single-model, router mode, backend bypass,
+// and the tiered cadence (v1.4.3)
 //
 // A router-mode llama-server (--models-preset) refuses a bare GET /slots with
 // HTTP 400 "model name is missing"; per-model state lives at
@@ -538,24 +540,69 @@ console.log("\n=== Part G: slots monitor — single + router mode (v1.4.3) ===")
 {
   const gtmp = mkdtempSync(join(tmpdir(), "ctx-hudG-"));
 
+  // G0: catalog → backend URL extraction (pure function).
+  {
+    const cat = (entries) => ({ data: entries });
+    const e = (id, value, args, aliases) => ({ id, aliases: aliases || [], status: { value, args: args || [] } });
+    check("G0 catalog: loaded model with --host/--port in args → backend URL",
+      backendUrlFromCatalog(cat([e("m", "loaded", ["--host", "127.0.0.1", "--port", "40357"])]), "m") === "http://127.0.0.1:40357/slots");
+    check("G0 catalog: alias match",
+      backendUrlFromCatalog(cat([e("m", "loaded", ["--port", "5000"], ["m-alias"])]), "m-alias") === "http://127.0.0.1:5000/slots");
+    check("G0 catalog: unloaded model → null",
+      backendUrlFromCatalog(cat([e("m", "unloaded", ["--port", "5000"])]), "m") === null);
+    check("G0 catalog: loaded but --port 0 (unassigned) → null",
+      backendUrlFromCatalog(cat([e("m", "loaded", ["--port", "0"])]), "m") === null);
+    check("G0 catalog: model absent from catalog → null",
+      backendUrlFromCatalog(cat([e("other", "loaded", ["--port", "5000"])]), "m") === null);
+    check("G0 catalog: malformed body → null",
+      backendUrlFromCatalog(null, "m") === null && backendUrlFromCatalog({ data: "x" }, "m") === null);
+  }
+
   // Mock llama.cpp endpoint.
   //   mode "single": bare /slots (model param ignored) → 200 slot array.
   //   mode "router": bare /slots → 400 "model name is missing" (the real
   //                  router's refusal); /slots?model=<name> → 200 array for
-  //                  a loaded model, 404 for an unknown one.
+  //                  a loaded model whose backend is up, 404 otherwise
+  //                  (a router cannot proxy to a dead backend).
+  //   /v1/models: the router-local catalog. Absent (404) unless catalogModels
+  //   is set; a loaded entry advertises its backend's real port in
+  //   status.args — exactly the shape of the real router's catalog.
   const slots = new Map(); // key "*" (single) or model name → state
   let mockMode = "single";
+  let catalogModels = null; // null → no /v1/models endpoint (404)
+  const backendUp = new Map(); // model → bool (gates the router's ?model proxy)
+  const hits = []; // t of every /slots request (cadence analysis)
+  let routerSlotsHits = 0; // /slots hits on the ROUTER (any form)
+  let modelsHits = 0; // /v1/models hits (discovery traffic)
+  const backendHitCounters = new Map(); // model → /slots hits on its backend
   const mock = http.createServer((req, res) => {
     const u = new URL(req.url, "http://127.0.0.1");
+    if (u.pathname.endsWith("/v1/models")) {
+      modelsHits++;
+      if (!catalogModels) { res.writeHead(404); res.end(); return; }
+      res.writeHead(200);
+      res.end(JSON.stringify({ data: Object.entries(catalogModels).map(([id, c]) => ({
+        id, aliases: c.aliases || [],
+        status: { value: c.value, args: c.args || [] },
+      })) }));
+      return;
+    }
     if (!u.pathname.endsWith("/slots")) {
       res.writeHead(404); res.end(); return;
     }
+    hits.push(Date.now());
+    routerSlotsHits++;
     const model = u.searchParams.get("model");
     if (mockMode === "router" && !model) {
       res.writeHead(400);
       res.end(JSON.stringify({
         error: { code: 400, message: "model name is missing from the request", type: "invalid_request_error" },
       }));
+      return;
+    }
+    if (mockMode === "router" && !backendUp.get(model)) {
+      res.writeHead(404);
+      res.end(JSON.stringify({ error: { message: "no backend for model" } }));
       return;
     }
     const s = (mockMode === "router" ? slots.get(model) : slots.get("*")) || null;
@@ -619,7 +666,33 @@ console.log("\n=== Part G: slots monitor — single + router mode (v1.4.3) ===")
   }
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  const mkClient = () => connectServer({ GOOSE_SESSIONS_DB: gdb, GOOSE_CUSTOM_PROVIDERS_DIR: gcp });
+  const mkClient = (extra = {}) =>
+    connectServer({
+      GOOSE_SESSIONS_DB: gdb,
+      GOOSE_CUSTOM_PROVIDERS_DIR: gcp,
+      GOOSE_SLOT_HEARTBEAT_MS: "150", // fast heartbeat so tests don't wait
+      ...extra,
+    });
+  // A mock per-model backend (what the router spawns): answers its own
+  // /slots silently — the point of the bypass.
+  const backends = [];
+  const mkBackend = async (slotKey, counterKey) => {
+    const b = http.createServer((req, res) => {
+      if (!req.url.endsWith("/slots")) { res.writeHead(404); res.end(); return; }
+      backendHitCounters.set(counterKey, (backendHitCounters.get(counterKey) || 0) + 1);
+      const s = slots.get(slotKey) || null;
+      if (!s) { res.writeHead(404); res.end(JSON.stringify({ error: "no model" })); return; }
+      res.writeHead(200);
+      res.end(JSON.stringify([{
+        id: 0, is_processing: s.processing, n_prompt_tokens: s.prompt,
+        next_token: s.processing ? [{ n_decoded: s.n_decoded }] : [],
+      }]));
+    });
+    await new Promise((r) => b.listen(0, "127.0.0.1", r));
+    const entry = { server: b, port: b.address().port };
+    backends.push(entry);
+    return entry;
+  };
   const stats = async (c, sessionId) => {
     const r = await c.callTool({ name: "get_context_stats", arguments: { session_id: sessionId } });
     return r.structuredContent ?? JSON.parse(r.content[0].text);
@@ -648,6 +721,8 @@ console.log("\n=== Part G: slots monitor — single + router mode (v1.4.3) ===")
   slots.clear();
   slots.set("model-a", { processing: true, n_decoded: 0, prompt: 9500 });
   slots.set("model-b", { processing: false, n_decoded: 0, prompt: 19500 });
+  backendUp.set("model-a", true); // (catalogModels still null → no bypass)
+  backendUp.set("model-b", true);
   {
     const c = await mkClient();
     await stats(c, "gsess-a"); // arms: first poll → 400 → router detected → ?model=
@@ -674,7 +749,97 @@ console.log("\n=== Part G: slots monitor — single + router mode (v1.4.3) ===")
     await c.close();
   }
 
+  // G5: tiered cadence. No catalog (404) → no bypass → the tiered router
+  // cadence applies: after SETTLE_MS of quiet the /slots request interval
+  // drops to the heartbeat, so an idle router (which logs every proxied
+  // request) isn't spammed 10×/s.
+  {
+    catalogModels = null;
+    slots.get("model-a").processing = true;
+    slots.get("model-a").n_decoded = 0;
+    const c = await mkClient({ GOOSE_SLOT_SETTLE_MS: "300", GOOSE_SLOT_HEARTBEAT_MS: "800" });
+    hits.length = 0;
+    await stats(c, "gsess-a");
+    await sleep(2000); // decode phase (50 ms cadence)
+    slots.get("model-a").processing = false;
+    const settleStart = Date.now();
+    await sleep(400); // settle window (300 ms) + margin
+    const settleEnd = Date.now();
+    await sleep(3000); // heartbeat phase (800 ms)
+    const gapsIn = (from, to) => {
+      const ts = hits.filter((t) => t >= from && t <= to);
+      const g = [];
+      for (let i = 1; i < ts.length; i++) g.push(ts[i] - ts[i - 1]);
+      return g;
+    };
+    const settleGaps = gapsIn(settleStart, settleEnd);
+    const heartGaps = gapsIn(settleEnd, Date.now());
+    check("G5 cadence: settle window polls at ~100 ms (a gap < 250 ms exists)",
+      settleGaps.length > 0 && Math.min(...settleGaps) < 250);
+    check("G5 cadence: after settle the interval is the ~800 ms heartbeat (500 < gap < 1200 ms)",
+      heartGaps.length >= 1 && Math.min(...heartGaps) > 500 && Math.max(...heartGaps) < 1200);
+    await c.close();
+  }
+
+  // G6: backend bypass. The router's /v1/models advertises model-a's backend
+  // port; after detection, /slots traffic goes to the (silent) backend
+  // instead of the router, which would log one line per proxied request.
+  {
+    slots.get("model-a").processing = true;
+    slots.get("model-a").n_decoded = 0;
+    const backend1 = await mkBackend("model-a", "b1");
+    backendUp.set("model-a", true);
+    catalogModels = {
+      "model-a": { value: "loaded", args: ["--host", "127.0.0.1", "--port", String(backend1.port)] },
+      "model-b": { value: "unloaded", args: ["--port", "0"] },
+    };
+    routerSlotsHits = 0; modelsHits = 0;
+    const c = await mkClient();
+    await stats(c, "gsess-a");
+    await sleep(800);
+    const r = await stats(c, "gsess-a");
+    check("G6 bypass: live tok/s via the backend endpoint (tpsMode live)",
+      r.tpsMode === "live" && r.live.active === true && r.live.estTps > 0);
+    check("G6 bypass: /slots traffic went to the backend, not the router proxy",
+      (backendHitCounters.get("b1") || 0) >= 3 && routerSlotsHits <= 3);
+    check("G6 bypass: discovery used the router-local /v1/models catalog",
+      modelsHits >= 1);
+    await c.close();
+
+    // G7: backend swap (crash/LRU). Phase A: a fresh monitor goes live via
+    // the advertised backend. Phase B: the backend dies while the catalog
+    // stays stale ("loaded" at the dead port — the sleep-idle trap): no
+    // fake live feed. Phase C: the router re-publishes the new port; the
+    // monitor's failure-driven re-validation follows the new backend.
+    const c2 = await mkClient(); // fresh process → fresh monitor
+    await stats(c2, "gsess-a");
+    await sleep(600);
+    let r2 = await stats(c2, "gsess-a");
+    check("G7 swap (A): fresh monitor is live via the advertised backend",
+      r2.tpsMode === "live" && r2.live.active === true);
+
+    await new Promise((res) => backend1.server.close(res));
+    backendUp.set("model-a", false); // router can no longer proxy to it
+    await sleep(1500);
+    r2 = await stats(c2, "gsess-a");
+    check("G7 swap (B): dead backend + stale catalog → no (fake) live feed",
+      r2.live.active === false);
+
+    backendHitCounters.set("b2", 0);
+    const backend2 = await mkBackend("model-a", "b2");
+    backendUp.set("model-a", true);
+    catalogModels["model-a"] = { value: "loaded", args: ["--host", "127.0.0.1", "--port", String(backend2.port)] };
+    await sleep(3500); // ≤2 s discovery throttle + settle
+    r2 = await stats(c2, "gsess-a");
+    check("G7 swap (C): monitor follows the re-published backend port (live again)",
+      r2.tpsMode === "live" && r2.live.active === true);
+    check("G7 swap (C): /slots traffic now hits the NEW backend",
+      (backendHitCounters.get("b2") || 0) > 0);
+    await c2.close();
+  }
+
   clearInterval(iv);
+  for (const b of backends) await new Promise((r) => b.server.close(r));
   await new Promise((r) => mock.close(r));
   rmSync(gtmp, { recursive: true, force: true });
 }

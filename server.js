@@ -557,6 +557,17 @@ function computeStats(explicitSessionId) {
 //     is per-model at GET /slots?model=<name>. That refusal is detected on
 //     the first poll, and from then on the tracked session's model name (from
 //     sessions.db, refreshed on every stats call) is appended to the URL.
+//
+// Router mode adds a backend bypass: the router logs one line per PROXIED
+// request, so steady polling spams its log. The router's router-local
+// GET /v1/models catalog advertises each loaded model's backend host/port
+// (in status.args), so once discovered the monitor polls the backend's own
+// /slots directly — silent, and free to keep the full cadence. The backend
+// cache is re-validated every REVALIDATE_MS (an evicted model's backend can
+// stay alive-but-sleeping for a while) and after 3 consecutive misses (LRU
+// swap → new port). Routers without a usable catalog, and the whole
+// single-model path, fall back to a tiered cadence on the router endpoint:
+// 100 ms for SETTLE_MS after activity, then a HEARTBEAT_POLL_MS heartbeat.
 // ---------------------------------------------------------------------------
 // Adaptive cadence: while a slot is decoding we want the tightest wall-clock
 // measurement possible (it bounds the completion hand-off's duration error —
@@ -570,10 +581,32 @@ const ACTIVE_POLL_MS = Math.min(
     : 50,
   IDLE_POLL_MS
 );
+// Tiered cadence: router-mode servers log every PROXIED request, so a steady
+// 10 Hz idle poll spams the server log 10 lines/s while nothing happens.
+// Keep the 100 ms idle cadence only for SETTLE_MS after the last processing
+// observation (tight hand-off end boundary + tool-loop bursts), then drop to
+// a slow heartbeat until the next activity.
+const SETTLE_MS =
+  Number(process.env.GOOSE_SLOT_SETTLE_MS) > 0 ? Number(process.env.GOOSE_SLOT_SETTLE_MS) : 10_000;
+const HEARTBEAT_POLL_MS =
+  Number(process.env.GOOSE_SLOT_HEARTBEAT_MS) > 0 ? Number(process.env.GOOSE_SLOT_HEARTBEAT_MS) : 1000;
+const REVALIDATE_MS =
+  Number(process.env.GOOSE_SLOT_REVALIDATE_MS) > 0 ? Number(process.env.GOOSE_SLOT_REVALIDATE_MS) : 60_000;
+const DISCOVER_THROTTLE_MS = 2000;
 export const slotMonitor = {
   url: process.env.GOOSE_SLOTS_URL || null, // fixed override (tests)
   model: "",    // tracked session's model name (scopes /slots in router mode)
   router: false, // true once the endpoint proved to be a model ROUTER
+  // Backend bypass (router mode): the router logs one line per PROXIED
+  // request, but the per-model backend server it spawns answers its own
+  // /slots silently. The backend's real port is advertised in the
+  // router-local GET /v1/models catalog (status.args carries --host/--port),
+  // so once discovered we poll the backend directly — zero log lines, and
+  // no reason to relax the cadence.
+  backendUrl: null,   // discovered backend /slots URL
+  backendModel: "",   // model the cached backendUrl belongs to
+  backendFails: 0,    // consecutive backend fetch failures (stale backend)
+  lastDiscoverAt: 0,  // t of last /v1/models attempt (throttle + re-validate)
   state: null,
   fetchedAt: 0,
   failures: 0,
@@ -582,6 +615,7 @@ export const slotMonitor = {
   samples: [],
   promptTokens: 0,
   wasProc: false,
+  lastProcEnd: 0, // t of the last proc→idle transition (drives the settle window)
 };
 
 function setSlotsUrlForProvider(provider) {
@@ -613,13 +647,91 @@ function slotsUrlNow() {
   }
 }
 
+// Pure (unit-testable): the backend server's /slots URL for `model` from a
+// router /v1/models catalog. The backend's real host/port ride in the model
+// entry's status.args (the llama-server invocation used to spawn it); a
+// loaded model without parseable args yields null → caller keeps polling
+// the router endpoint (tiered cadence).
+export function backendUrlFromCatalog(catalog, model) {
+  if (!catalog || !Array.isArray(catalog.data)) return null;
+  for (const entry of catalog.data) {
+    if (!entry) continue;
+    const isModel =
+      entry.id === model ||
+      (Array.isArray(entry.aliases) && entry.aliases.includes(model));
+    if (!isModel) continue;
+    const st = entry.status || {};
+    if (st.value !== "loaded") return null;
+    const args = Array.isArray(st.args) ? st.args : [];
+    let host = "127.0.0.1";
+    let port = 0;
+    for (let i = 0; i + 1 < args.length; i++) {
+      if (args[i] === "--port") port = Number(args[i + 1]);
+      else if (args[i] === "--host") host = String(args[i + 1]);
+    }
+    if (!Number.isInteger(port) || port <= 0 || port > 65535) return null;
+    return `http://${host}:${port}/slots`;
+  }
+  return null;
+}
+
+// Throttled backend discovery / re-validation (router mode only). Runs:
+//   - once per REVALIDATE_MS while the cached backend is healthy — closing
+//     the "sleeping backend" trap: llama.cpp's --sleep-idle-seconds can keep
+//     an evicted model's backend alive for a while, so a cached port can
+//     keep "succeeding" against a stale idle backend after an LRU swap;
+//   - immediately after the cached backend failed 3 consecutive fetches
+//     (backend respawned on a new port);
+//   - at most once per DISCOVER_THROTTLE_MS for any reason.
+async function maybeDiscoverBackend() {
+  const m = slotMonitor;
+  if (!m.router || !m.model || !m.url) return;
+  const healthy = m.backendUrl && m.backendModel === m.model && m.backendFails < 3;
+  if (healthy && Date.now() - m.lastDiscoverAt < REVALIDATE_MS) return;
+  if (Date.now() - m.lastDiscoverAt < DISCOVER_THROTTLE_MS) return;
+  m.lastDiscoverAt = Date.now();
+  let catalog = null;
+  try {
+    const base = m.url.replace(/\/slots\/?$/, "");
+    const ctrl = new AbortController();
+    const to = setTimeout(() => ctrl.abort(), 500);
+    const r = await fetch(base + "/v1/models", { signal: ctrl.signal });
+    clearTimeout(to);
+    catalog = await r.json().catch(() => null);
+  } catch {
+    catalog = null; // router unreachable / no catalog → stay on the router endpoint
+  }
+  const found = backendUrlFromCatalog(catalog, m.model);
+  if (found && found !== m.backendUrl) {
+    m.backendUrl = found;
+    m.backendModel = m.model;
+    m.backendFails = 0;
+    // A (re)discovered backend is a new slot timeline — drop samples taken
+    // against the previous endpoint (old model, or the router).
+    m.state = null;
+    m.fetchedAt = 0;
+    m.samples = [];
+    m.startAt = null;
+    m.wasProc = false;
+    m.promptTokens = 0;
+  } else if (!found && m.backendUrl) {
+    m.backendUrl = null; // model unloaded (or no port info) → router endpoint
+    m.backendModel = "";
+    m.backendFails = 0;
+  }
+}
+
 // The tracked session's model name, refreshed on every stats call. A change
-// discards the previous model's decode samples so its hand-off cannot be
-// attributed to this session (the slot is per-model, not per-session).
+// discards the previous model's decode samples AND its backend cache, so its
+// hand-off cannot be attributed to this session (slots are per-model, not
+// per-session).
 export function setSlotsModel(model) {
   const m = typeof model === "string" ? model.trim() : "";
   if (m === slotMonitor.model) return;
   slotMonitor.model = m;
+  slotMonitor.backendUrl = null;
+  slotMonitor.backendModel = "";
+  slotMonitor.backendFails = 0;
   slotMonitor.state = null;
   slotMonitor.fetchedAt = 0;
   slotMonitor.samples = [];
@@ -630,7 +742,9 @@ export function setSlotsModel(model) {
 
 async function pollSlots() {
   if (!slotMonitor.url) return false;
-  const url = slotsUrlNow();
+  await maybeDiscoverBackend();
+  const viaBackend = !!slotMonitor.backendUrl;
+  const url = viaBackend ? slotMonitor.backendUrl : slotsUrlNow();
   const hadModel = slotMonitor.router && !!slotMonitor.model;
   try {
     const ctrl = new AbortController();
@@ -640,14 +754,16 @@ async function pollSlots() {
     const body = await r.json().catch(() => null);
     if (body === null) throw new Error("http " + r.status);
     if (Array.isArray(body)) {
+      if (viaBackend) slotMonitor.backendFails = 0;
       // A bare /slots answering with a plain array means we are NOT talking
       // to a router after all (single-model server) — drop the flag.
-      if (slotMonitor.router && !hadModel) slotMonitor.router = false;
+      if (slotMonitor.router && !viaBackend && !hadModel) slotMonitor.router = false;
       slotMonitor.state = body;
       slotMonitor.fetchedAt = Date.now();
       slotMonitor.failures = 0;
       return true;
     }
+    if (viaBackend) return backendMiss(); // a real backend never answers objects
     // A single-model llama-server always answers /slots with an array, so a
     // JSON object here (the router's HTTP 400 "model name is missing") means
     // we are talking to a model ROUTER: mark it and retry once, this time
@@ -667,13 +783,34 @@ async function pollSlots() {
     // observe right now; not counted as a fetch failure.
     return false;
   } catch {
+    if (viaBackend) return backendMiss();
     slotMonitor.failures++;
     if (slotMonitor.failures > 60) {
       slotMonitor.url = null;
       slotMonitor.router = false; // re-derived + re-detected on next stats call
+      slotMonitor.backendUrl = null;
+      slotMonitor.backendModel = "";
+      slotMonitor.backendFails = 0;
     }
     return false;
   }
+}
+
+// A fetch against the (believed) backend failed: connection refused (LRU
+// swap), abort (router wedged), or a non-array answer. Three consecutive
+// misses clear the cache and zero lastDiscoverAt so the NEXT poll
+// re-validates against the catalog immediately; meanwhile the loop keeps
+// running on the router endpoint (tiered cadence).
+function backendMiss() {
+  const m = slotMonitor;
+  m.backendFails++;
+  if (m.backendFails >= 3) {
+    m.backendUrl = null;
+    m.backendModel = "";
+    m.backendFails = 0;
+    m.lastDiscoverAt = 0;
+  }
+  return false;
 }
 
 // Slot state machine, driven by the /slots poll loop (NOT by guest stats
@@ -702,7 +839,10 @@ export function slotStateTransition(nowMs) {
       slotMonitor.samples.shift();
     }
   } else {
-    if (slotMonitor.wasProc) captureHandoff(nowMs);
+    if (slotMonitor.wasProc) {
+      slotMonitor.lastProcEnd = nowMs;
+      captureHandoff(nowMs);
+    }
     slotMonitor.wasProc = false;
     slotMonitor.startAt = null;
     slotMonitor.samples = [];
@@ -1022,12 +1162,24 @@ async function main() {
   // Self-rescheduling so a slow fetch can never queue up overlapping
   // requests. Each successful fetch advances the slot state machine, so the
   // hand-off boundary estimates sit on this poll grid.
+  // Adaptive poll loop: 50 ms while a slot is decoding; 100 ms during the
+  // settle window and whenever a silent backend is being polled; otherwise
+  // the 1 s heartbeat, so a router that logs every proxied request isn't
+  // spammed by steady idle polling.
   const pollLoop = () => {
     pollSlots()
       .catch(() => false)
       .then((ok) => {
         if (ok) slotStateTransition(Date.now());
-        setTimeout(pollLoop, isAnySlotProcessing() ? ACTIVE_POLL_MS : IDLE_POLL_MS);
+        const now = Date.now();
+        const settling =
+          slotMonitor.lastProcEnd > 0 && now - slotMonitor.lastProcEnd < SETTLE_MS;
+        const delay = isAnySlotProcessing()
+          ? ACTIVE_POLL_MS
+          : slotMonitor.backendUrl || settling
+            ? IDLE_POLL_MS
+            : HEARTBEAT_POLL_MS;
+        setTimeout(pollLoop, delay);
       });
   };
   pollLoop();
