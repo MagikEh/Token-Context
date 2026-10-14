@@ -593,6 +593,18 @@ const HEARTBEAT_POLL_MS =
 const REVALIDATE_MS =
   Number(process.env.GOOSE_SLOT_REVALIDATE_MS) > 0 ? Number(process.env.GOOSE_SLOT_REVALIDATE_MS) : 60_000;
 const DISCOVER_THROTTLE_MS = 2000;
+// Completion-anchored polling: /slots is NOT sleep-timer-exempt, so ANY
+// steady polling (even 1 Hz) keeps the backend awake forever. Instead of a
+// permanent heartbeat we poll only for a bounded window after the last DB
+// completion, then go fully dormant (zero /slots traffic) so the backend's
+// --sleep-idle-seconds countdown can actually elapse and VRAM is freed.
+// The HUD's 5 Hz stats polling reads the DB and updates lastCompletionAt,
+// waking the loop when a new response completes.
+const AWAIT_MS =
+  Number(process.env.GOOSE_SLOT_AWAIT_MS) > 0 ? Number(process.env.GOOSE_SLOT_AWAIT_MS) : 120_000;
+// How often to re-evaluate the dormant condition without making an HTTP call.
+const DORMANT_POLL_MS =
+  Number(process.env.GOOSE_SLOT_DORMANT_POLL_MS) > 0 ? Number(process.env.GOOSE_SLOT_DORMANT_POLL_MS) : 5_000;
 export const slotMonitor = {
   url: process.env.GOOSE_SLOTS_URL || null, // fixed override (tests)
   model: "",    // tracked session's model name (scopes /slots in router mode)
@@ -616,6 +628,7 @@ export const slotMonitor = {
   promptTokens: 0,
   wasProc: false,
   lastProcEnd: 0, // t of the last proc→idle transition (drives the settle window)
+  lastCompletionAt: 0, // ms timestamp of the most recent usage_ledger completion
 };
 
 function setSlotsUrlForProvider(provider) {
@@ -964,6 +977,8 @@ function lastResponseTps(db, sessionId) {
       )
       .get(sessionId);
     if (!last) return { tps: 0, src: "db" };
+    // Update the completion anchor for the poll loop's await window.
+    slotMonitor.lastCompletionAt = toMs(last.created_timestamp);
     const key = sessionId + ":" + last.created_timestamp;
     if (_lastTpsCache.key === key) {
       return { tps: _lastTpsCache.tps, src: _lastTpsCache.src };
@@ -1158,27 +1173,52 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  // Adaptive poll loop: 50ms while a slot is processing, 100ms when idle.
-  // Self-rescheduling so a slow fetch can never queue up overlapping
-  // requests. Each successful fetch advances the slot state machine, so the
-  // hand-off boundary estimates sit on this poll grid.
-  // Adaptive poll loop: 50 ms while a slot is decoding; 100 ms during the
-  // settle window and whenever a silent backend is being polled; otherwise
-  // the 1 s heartbeat, so a router that logs every proxied request isn't
-  // spammed by steady idle polling.
+  // Completion-anchored poll loop:
+  //   • 50 ms while a slot is decoding (tight hand-off boundary)
+  //   • 100 ms within AWAIT_MS of the last DB completion (catches tool-loop
+  //     bursts, re-enters for the next response in a multi-turn exchange)
+  //   • 100 ms during SETTLE_MS after the last processing observation
+  //     (tight end-boundary for the hand-off estimate)
+  //   • HEARTBEAT_POLL_MS (1 s) when the backend bypass is unavailable and
+  //     we're outside the settle window but still within the await window
+  //     (limits router proxy log spam in the fallback case)
+  //   • DORMANT: no /slots traffic at all beyond AWAIT_MS, so the backend's
+  //     --sleep-idle-seconds countdown can elapse and VRAM is freed.
+  // The HUD's 5 Hz stats polling reads the DB and updates
+  // slotMonitor.lastCompletionAt, waking the loop when a new response lands.
   const pollLoop = () => {
+    const now = Date.now();
+    const proc = isAnySlotProcessing();
+    const inAwait =
+      slotMonitor.lastCompletionAt > 0 &&
+      now - slotMonitor.lastCompletionAt < AWAIT_MS;
+
+    if (!proc && !inAwait) {
+      // Dormant — skip the HTTP fetch entirely. Re-check the condition
+      // periodically; the stats handler will update lastCompletionAt when
+      // a new response completes.
+      setTimeout(pollLoop, DORMANT_POLL_MS);
+      return;
+    }
+
     pollSlots()
       .catch(() => false)
       .then((ok) => {
         if (ok) slotStateTransition(Date.now());
-        const now = Date.now();
+        const now2 = Date.now();
+        const proc2 = isAnySlotProcessing();
+        const inAwait2 =
+          slotMonitor.lastCompletionAt > 0 &&
+          now2 - slotMonitor.lastCompletionAt < AWAIT_MS;
         const settling =
-          slotMonitor.lastProcEnd > 0 && now - slotMonitor.lastProcEnd < SETTLE_MS;
-        const delay = isAnySlotProcessing()
+          slotMonitor.lastProcEnd > 0 && now2 - slotMonitor.lastProcEnd < SETTLE_MS;
+        const delay = proc2
           ? ACTIVE_POLL_MS
-          : slotMonitor.backendUrl || settling
-            ? IDLE_POLL_MS
-            : HEARTBEAT_POLL_MS;
+          : inAwait2
+            ? slotMonitor.backendUrl || settling
+              ? IDLE_POLL_MS
+              : HEARTBEAT_POLL_MS
+            : DORMANT_POLL_MS;
         setTimeout(pollLoop, delay);
       });
   };

@@ -647,7 +647,8 @@ console.log("\n=== Part G: slots monitor — single + router mode (v1.4.3) ===")
       CREATE TABLE usage_ledger (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id TEXT, created_timestamp INTEGER,
-        input_tokens INTEGER, output_tokens INTEGER
+        input_tokens INTEGER, output_tokens INTEGER,
+        is_compaction INTEGER DEFAULT 0
       );
     `);
     const ins = db.prepare(`INSERT INTO sessions
@@ -662,6 +663,12 @@ console.log("\n=== Part G: slots monitor — single + router mode (v1.4.3) ===")
       20000, 18000, 2000, 15000, 200000, gnow - 2000);
     ins.run("gsess-c", "No Model", "user", "gp", JSON.stringify({}),
       5000, 4000, 1000, 3000, 50000, gnow - 1000);
+    // A recent ledger row so the completion-anchored await window is active.
+    const led = db.prepare(`INSERT INTO usage_ledger
+      (session_id, created_timestamp, input_tokens, output_tokens, is_compaction)
+      VALUES (?,?,?,?,0)`);
+    led.run("gsess-a", Math.floor(gnow / 1000), 100, 500);
+    led.run("gsess-b", Math.floor(gnow / 1000), 100, 300);
     db.close();
   }
 
@@ -671,6 +678,8 @@ console.log("\n=== Part G: slots monitor — single + router mode (v1.4.3) ===")
       GOOSE_SESSIONS_DB: gdb,
       GOOSE_CUSTOM_PROVIDERS_DIR: gcp,
       GOOSE_SLOT_HEARTBEAT_MS: "150", // fast heartbeat so tests don't wait
+      GOOSE_SLOT_AWAIT_MS: "10000",   // 10 s await window (covers all test phases)
+      GOOSE_SLOT_DORMANT_POLL_MS: "100", // fast dormant re-check
       ...extra,
     });
   // A mock per-model backend (what the router spawns): answers its own
@@ -749,35 +758,51 @@ console.log("\n=== Part G: slots monitor — single + router mode (v1.4.3) ===")
     await c.close();
   }
 
-  // G5: tiered cadence. No catalog (404) → no bypass → the tiered router
-  // cadence applies: after SETTLE_MS of quiet the /slots request interval
-  // drops to the heartbeat, so an idle router (which logs every proxied
-  // request) isn't spammed 10×/s.
+  // Refresh the ledger timestamp so the await window starts fresh for G5-G7.
+  {
+    const fixDb = new DatabaseSync(gdb);
+    fixDb.prepare(`UPDATE usage_ledger SET created_timestamp = ? WHERE session_id = 'gsess-a'`)
+      .run(Math.floor(Date.now() / 1000));
+    fixDb.close();
+  }
+
+  // G5: completion-anchored cadence + dormant transition. No catalog (404)
+  // → no bypass → the tiered router cadence applies within the await window.
+  // After AWAIT_MS the monitor goes fully dormant: zero /slots traffic so
+  // the backend's --sleep-idle-seconds countdown can elapse.
   {
     catalogModels = null;
     slots.get("model-a").processing = true;
     slots.get("model-a").n_decoded = 0;
-    const c = await mkClient({ GOOSE_SLOT_SETTLE_MS: "300", GOOSE_SLOT_HEARTBEAT_MS: "800" });
+    const c = await mkClient({
+      GOOSE_SLOT_SETTLE_MS: "300",
+      GOOSE_SLOT_HEARTBEAT_MS: "800",
+      GOOSE_SLOT_AWAIT_MS: "5000", // generous window (client spawn eats ~800ms)
+    });
     hits.length = 0;
-    await stats(c, "gsess-a");
-    await sleep(2000); // decode phase (50 ms cadence)
+    await stats(c, "gsess-a"); // arms the monitor + sets lastCompletionAt
+    await sleep(1000); // decode phase (50 ms cadence)
     slots.get("model-a").processing = false;
-    const settleStart = Date.now();
-    await sleep(400); // settle window (300 ms) + margin
-    const settleEnd = Date.now();
-    await sleep(3000); // heartbeat phase (800 ms)
+    const postDecode = Date.now();
+    await sleep(500); // within await window
+    const inAwait = Date.now();
+    await sleep(3500); // wait past AWAIT_MS expiry (5000ms from DB refresh)
+    const postAwait = Date.now();
     const gapsIn = (from, to) => {
       const ts = hits.filter((t) => t >= from && t <= to);
       const g = [];
       for (let i = 1; i < ts.length; i++) g.push(ts[i] - ts[i - 1]);
       return g;
     };
-    const settleGaps = gapsIn(settleStart, settleEnd);
-    const heartGaps = gapsIn(settleEnd, Date.now());
-    check("G5 cadence: settle window polls at ~100 ms (a gap < 250 ms exists)",
-      settleGaps.length > 0 && Math.min(...settleGaps) < 250);
-    check("G5 cadence: after settle the interval is the ~800 ms heartbeat (500 < gap < 1200 ms)",
-      heartGaps.length >= 1 && Math.min(...heartGaps) > 500 && Math.max(...heartGaps) < 1200);
+    // During the await window (post-decode), polls should still be happening.
+    const awaitGaps = gapsIn(postDecode, inAwait);
+    check("G5 dormant: polls continue within the await window (settle→heartbeat tier)",
+      awaitGaps.length > 0);
+    // After AWAIT_MS expires: NO new /slots hits.
+    const hitsInAwait = hits.filter((t) => t >= postDecode && t <= inAwait).length;
+    const hitsAfterAwait = hits.filter((t) => t > postAwait).length;
+    check("G5 dormant: zero /slots traffic after AWAIT_MS expires (sleep timer can elapse)",
+      hitsInAwait >= 3 && hitsAfterAwait === 0);
     await c.close();
   }
 
@@ -811,6 +836,13 @@ console.log("\n=== Part G: slots monitor — single + router mode (v1.4.3) ===")
     // stays stale ("loaded" at the dead port — the sleep-idle trap): no
     // fake live feed. Phase C: the router re-publishes the new port; the
     // monitor's failure-driven re-validation follows the new backend.
+    // Refresh the ledger timestamp so the await window covers G7's ~5.6s.
+    {
+      const fixDb = new DatabaseSync(gdb);
+      fixDb.prepare(`UPDATE usage_ledger SET created_timestamp = ? WHERE session_id = 'gsess-a'`)
+        .run(Math.floor(Date.now() / 1000));
+      fixDb.close();
+    }
     const c2 = await mkClient(); // fresh process → fresh monitor
     await stats(c2, "gsess-a");
     await sleep(600);

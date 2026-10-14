@@ -2,6 +2,22 @@
 
 All notable changes to Token Context. The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.4.4] — 2026-10-14
+
+### Changed — completion-anchored polling (VRAM sleep fix)
+
+`/slots` is **not** in llama.cpp's sleep-timer-exempt list (only `/health`, `/props`, `/models`, `/metrics` are), so *any* steady `/slots` polling — even a 1 Hz heartbeat — resets the `--sleep-idle-seconds` countdown and keeps ~23 GB of VRAM resident indefinitely.
+
+The poll loop is now **completion-anchored**: it polls only for a bounded window after the last DB-completed response, then goes fully dormant (zero `/slots` traffic) so the backend's sleep timer can actually elapse and VRAM is freed.
+
+- **50 ms** while a slot is decoding (tight hand-off boundary measurement).
+- **100 ms** within `GOOSE_SLOT_AWAIT_MS` (default 120 s) of the last `usage_ledger` completion — catches tool-loop bursts and multi-turn exchanges.
+- **Dormant** (no HTTP) beyond the await window. The HUD's 5 Hz stats polling reads the DB and refreshes the completion anchor, waking the monitor when a new response lands.
+- The existing tiered cadence (settle → heartbeat) is retained as a sub-tier within the await window for routers without the silent backend bypass.
+- Two new env vars: `GOOSE_SLOT_AWAIT_MS` (default 120 000) and `GOOSE_SLOT_DORMANT_POLL_MS` (default 5 000, the re-check interval while dormant — no network I/O).
+
+Trade-off: the first response after a quiet gap (>120 s) loses the live tok/s dot and falls back to the DB whole-second rate. In practice the HUD is always polling stats at 5 Hz, so the anchor is always fresh for active sessions.
+
 ## [1.4.3] — 2026-10-13
 
 ### Fixed — live tok/s for llama.cpp in router mode (`--models-preset`)
