@@ -4,9 +4,13 @@ All notable changes to Token Context. The format is based on [Keep a Changelog](
 
 ## [1.4.5] — 2026-10-14
 
-### Refactor — code cleanup (no user-visible changes)
+### Changed — faster wake from dormancy
 
-A zero-context-readability pass over `server.js`. All behaviour is unchanged — the full 82-check suite passes unmodified.
+`GOOSE_SLOT_DORMANT_POLL_MS` default lowered from 5000 ms to 1000 ms. The dormant re-check is local-only (no HTTP), so the shorter interval costs nothing and cuts worst-case wake latency after a prompt submit to ~1.2 s — previously a *warm* (not unloaded) backend could miss up to ~5 s of a response's start (cold loads masked the delay, so it only bit in the warm case).
+
+### Refactor — code cleanup
+
+A zero-context-readability pass over `server.js`; the only other change is the dormant default above. The full 82-check suite passes unmodified.
 
 - **Sections reordered to dependency order** (top of file → bottom): SQLite access → context-window resolution → shared stats primitives → HUD claim broker → live `/slots` monitor → stats computation → MCP server → entry point. `computeStats` and `resolveContextWindow` no longer reference code defined below them, and the stats engine no longer sits under the "HUD pop-out claim" banner (it was always stats code).
 - **Duplicated resets extracted**: the backend cache and decode timeline were both reset field-by-field at 4 and 2 sites respectively; they are now `clearBackendCache()` / `resetSlotTimeline()` with the invariant (per-model state) documented in one place.
@@ -14,7 +18,7 @@ A zero-context-readability pass over `server.js`. All behaviour is unchanged —
 - **Small dedups**: the await-window predicate (used twice in the poll loop) is `inAwaitWindow()`; tool-argument parsing in the call handler is `argStr()`; the percent-rounding helper is module-level `round2`.
 - **Config reads are uniformly on-demand**: `GOOSE_LOCAL_MODEL_SETTINGS` context sizes were cached at module load while every other config read was fresh per stats call; they are now read on demand, so a config edit (or a config file briefly unreadable at startup) applies without an extension restart.
 - **API surface trimmed**: `setSlotsModel` / `captureHandoff` were exported but consumed only internally — the exports exist for the test harness only, and that convention is now documented.
-- **Docs**: the header env-var list now covers all knobs (grouped), the stale `1.4.3` server version constant is fixed (matched `package.json`), and WHY comments explain the decisions a maintainer would otherwise have to rediscover (freshness of config reads, completion-anchored dormancy in the monitor banner, the `liveEstimate` correlation guard).
+- **Docs**: the header env-var list now covers all knobs (grouped), the stale `1.4.3` server version constant is fixed (matched `package.json`), and WHY comments explain the decisions a maintainer would otherwise have to rediscover (freshness of config reads, completion-anchored dormancy in the monitor banner, the `liveEstimate` correlation guard). The generation-pending and completion-anchor comments now record that goose's `UserPromptSubmit` / `Stop` hooks are the official signals for those moments and why the DB-based observation is used instead (hooks are `sh -c` commands with no channel to a stdio MCP server) — so the design doesn't get "fixed" into a slower hook-based path in the future.
 
 ## [1.4.4] — 2026-10-14
 
@@ -30,7 +34,7 @@ The poll loop is now **completion-anchored**: it polls only for a bounded window
 - The existing tiered cadence (settle → heartbeat) is retained as a sub-tier within the await window for routers without the silent backend bypass.
 - Two new env vars: `GOOSE_SLOT_AWAIT_MS` (default 120 000) and `GOOSE_SLOT_DORMANT_POLL_MS` (default 5 000, the re-check interval while dormant — no network I/O).
 
-Trade-off: the first response after a quiet gap (>120 s) loses the live tok/s dot and falls back to the DB whole-second rate. In practice the HUD is always polling stats at 5 Hz, so the anchor is always fresh for active sessions.
+Trade-off: the first response after a quiet gap (>120 s) can lose the earliest moments of the live tok/s dot while the dormant monitor re-checks its wake condition. The **generation-pending** wake signal (same release) covers this: a `messages` row without a matching `usage_ledger` row means generation just started, which wakes the monitor within one stats tick (~200 ms) plus one dormant re-check, so the live feed appears as soon as the backend is decoding.
 
 ## [1.4.3] — 2026-10-13
 

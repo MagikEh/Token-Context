@@ -475,8 +475,10 @@ const DISCOVER_THROTTLE_MS = 2000;
 const AWAIT_MS =
   Number(process.env.GOOSE_SLOT_AWAIT_MS) > 0 ? Number(process.env.GOOSE_SLOT_AWAIT_MS) : 120_000;
 // How often to re-evaluate the dormant condition without making an HTTP call.
+// 1 s keeps post-prompt wake latency short (<=~1.2 s with the 200 ms stats
+// tick); the re-check is local-only, so the interval costs no HTTP.
 const DORMANT_POLL_MS =
-  Number(process.env.GOOSE_SLOT_DORMANT_POLL_MS) > 0 ? Number(process.env.GOOSE_SLOT_DORMANT_POLL_MS) : 5_000;
+  Number(process.env.GOOSE_SLOT_DORMANT_POLL_MS) > 0 ? Number(process.env.GOOSE_SLOT_DORMANT_POLL_MS) : 1_000;
 export const slotMonitor = {
   url: process.env.GOOSE_SLOTS_URL || null, // fixed override (tests)
   model: "",    // tracked session's model name (scopes /slots in router mode)
@@ -862,6 +864,9 @@ function lastResponseTps(db, sessionId) {
       .get(sessionId);
     if (!last) return { tps: 0, src: "db" };
     // Update the completion anchor for the poll loop's await window.
+    // goose's official signal for turn completion is the Stop hook event,
+    // but hooks have no channel to a stdio MCP server, so we observe the
+    // ledger row itself (written at completion) — see the hooks guide.
     slotMonitor.lastCompletionAt = toMs(last.created_timestamp);
     const key = sessionId + ":" + last.created_timestamp;
     if (_lastTpsCache.key === key) {
@@ -1008,6 +1013,12 @@ function computeStats(explicitSessionId) {
       // loop wake from dormancy within one stats tick (~200 ms) of the
       // user hitting send, so the first response after a quiet gap still
       // gets live tok/s.
+      // goose's official signal for this moment is the UserPromptSubmit hook
+      // event, but hooks run as sh -c commands with no channel to a stdio
+      // MCP server — so we observe goose's own DB writes instead (the
+      // messages row lands at submit time). Don't "fix" this with a hook:
+      // it would only add a plugin + script + temp file for the same signal
+      // delivered on a slower cadence.
       try {
         const lastMsg = db.prepare(
           `SELECT MAX(created_timestamp) t FROM messages WHERE session_id = ?`
