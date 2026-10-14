@@ -1,6 +1,6 @@
 {
   "name": "token-context",
-  "version": "1.4.4",
+  "version": "1.4.5",
   "description": "Token Context MCP App for goose desktop: live tokens/sec + context-window usage indicator, pinned above the chat input",
   "type": "module",
   "main": "server.js",

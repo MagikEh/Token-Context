@@ -28,13 +28,21 @@
  *   4. goose config.yaml GOOSE_LOCAL_MODEL_SETTINGS context_size (local provider)
  *   5. DEFAULT_WINDOW (200000)
  *
- * Env vars (all optional):
- *   GOOSE_SESSIONS_DB            path to sessions.db (default: auto-discover)
- *   GOOSE_CONTEXT_WINDOW         context window in tokens (overrides all)
- *   GOOSE_CUSTOM_PROVIDERS_DIR   dir containing custom provider JSON files
- *   GOOSE_HUD_CLAIM_TTL_MS       liveness TTL for the popped-out HUD slot
- *                                (default 3000; test hook)
- *   AGENT_SESSION_ID             injected by goose for session-scoped extensions
+ * Env vars (all optional; full table with defaults in README.md):
+ *   store / config:
+ *     GOOSE_SESSIONS_DB            path to sessions.db (default: auto-discover)
+ *     GOOSE_CONTEXT_WINDOW         context window in tokens (overrides all)
+ *     GOOSE_CUSTOM_PROVIDERS_DIR   dir containing custom provider JSON files
+ *     GOOSE_CONFIG_PATH            goose config.yaml path (test hook)
+ *     GOOSE_AUTO_COMPACT_THRESHOLD context-bar triggers (env → config.yaml → 0.8)
+ *   /slots monitor:
+ *     GOOSE_SLOTS_URL, GOOSE_SLOT_POLL_MS, GOOSE_SLOT_ACTIVE_POLL_MS,
+ *     GOOSE_SLOT_SETTLE_MS, GOOSE_SLOT_HEARTBEAT_MS, GOOSE_SLOT_REVALIDATE_MS,
+ *     GOOSE_SLOT_AWAIT_MS, GOOSE_SLOT_DORMANT_POLL_MS, GOOSE_TPS_OFFSET_MS
+ *   HUD claim broker:
+ *     GOOSE_HUD_CLAIM_TTL_MS, GOOSE_HUD_CLAIM_TAKEOVER_MS
+ *   injected by goose (not user settings):
+ *     AGENT_SESSION_ID             scopes this process to one session
  */
 
 import { readFileSync, existsSync, readdirSync } from "node:fs";
@@ -55,7 +63,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const APP_HTML = readFileSync(join(__dirname, "index.html"), "utf-8");
 const RESOURCE_URI = "ui://token-context/hud";
 const SERVER_NAME = "token-context";
-const SERVER_VERSION = "1.4.3";
+const SERVER_VERSION = "1.4.5";
 
 // ---------------------------------------------------------------------------
 // SQLite access (read-only). Uses the built-in `node:sqlite` (Node >= 22.5).
@@ -128,6 +136,9 @@ const CUSTOM_PROVIDERS_DIR =
  *   byProvider: Map<providerName, Map<modelName, contextLimit>>
  *   byModel:    Map<modelName, contextLimit>  (fallback when the session's
  *              provider_name does not match any custom provider's `name`)
+ *   baseUrlByProvider: Map<providerName, baseUrl>  (source of the /slots URL)
+ * Re-read on every stats call (not cached): provider JSON edits apply without
+ * an extension restart; the directory holds a handful of small files.
  */
 function loadCustomProviders() {
   const byProvider = new Map();
@@ -174,38 +185,10 @@ function lookupInMap(map, key) {
   return undefined;
 }
 
-function resolveContextWindow(model, provider) {
-  if (process.env.GOOSE_CONTEXT_WINDOW) {
-    const n = parseInt(process.env.GOOSE_CONTEXT_WINDOW, 10);
-    if (Number.isFinite(n) && n > 0) return n;
-  }
-  if (model) {
-    // Custom providers are authoritative for the models they define.
-    const { byProvider, byModel } = loadCustomProviders();
-    if (provider) {
-      const perProvider = lookupInMap(byProvider, provider);
-      if (perProvider) {
-        const limit = lookupInMap(perProvider, model);
-        if (limit !== undefined) return limit;
-      }
-    }
-    const byModelLimit = lookupInMap(byModel, model);
-    if (byModelLimit !== undefined) return byModelLimit;
-
-    for (const [re, w] of MODEL_WINDOWS) if (re.test(model)) return w;
-    // The built-in "local" provider is managed by goose itself, so its
-    // GOOSE_LOCAL_MODEL_SETTINGS context_size is authoritative.
-    if (provider === "local") {
-      for (const [key, size] of LOCAL_MODEL_SIZES) {
-        if (key === model || key.startsWith(model + ":")) return size;
-      }
-    }
-  }
-  return DEFAULT_WINDOW;
-}
-
 /** Best-effort read of a root-level scalar key from goose's config.yaml
- *  (column-0 keys only, so nested keys under other sections never match). */
+ *  (column-0 keys only, so nested keys under other sections never match).
+ *  Re-read on every stats call: config edits apply without an extension
+ *  restart (the file is small and page-cached). */
 function configRootValue(key) {
   let text;
   try {
@@ -219,41 +202,10 @@ function configRootValue(key) {
   return m ? m[1].replace(/^["']|["']$/g, "") : undefined;
 }
 
-/**
- * Context-bar colour triggers, derived from the session's auto-compaction
- * point so they scale with any context window:
- *   red    = GOOSE_AUTO_COMPACT_THRESHOLD (goose default 0.8 = 80 % of the
- *            window; 0.0 disables auto-compaction → legacy 90 % red point)
- *   yellow = 80 % of red (WARN_RATIO), so the two always move together.
- * Precedence: server process env → config.yaml root key → goose default.
- */
-const WARN_RATIO = 0.8;
-const DEFAULT_COMPACT_THRESHOLD = 0.8; // goose's documented default
-const LEGACY_DANGER_PCT = 90;          // red point when auto-compaction is off
-
-export function resolveBarThresholds() {
-  let t = null; // fraction 0..1; 0 = explicitly disabled; null = unset
-  for (const raw of [
-    process.env.GOOSE_AUTO_COMPACT_THRESHOLD,
-    configRootValue("GOOSE_AUTO_COMPACT_THRESHOLD"),
-  ]) {
-    if (raw === undefined || raw === null || String(raw).trim() === "") continue;
-    const n = Number(raw);
-    if (Number.isFinite(n) && n >= 0 && n <= 1) { t = n; break; }
-  }
-  const dangerPct =
-    t === null ? DEFAULT_COMPACT_THRESHOLD * 100
-    : t === 0 ? LEGACY_DANGER_PCT
-    : t * 100;
-  const r2 = (x) => Math.round(x * 100) / 100;
-  return {
-    compactionThreshold: t === null ? DEFAULT_COMPACT_THRESHOLD : t,
-    dangerPct: r2(dangerPct),
-    warnPct: r2(dangerPct * WARN_RATIO),
-  };
-}
-
-/** Best-effort parse of GOOSE_LOCAL_MODEL_SETTINGS -> context_size from config.yaml. */
+/** Best-effort parse of GOOSE_LOCAL_MODEL_SETTINGS -> context_size from config.yaml.
+ *  Read on demand (not cached at module load): same no-restart semantics as
+ *  the other config.yaml reads — a config edit, or a config file that was
+ *  briefly unreadable at startup, applies without an extension restart. */
 function readLocalModelContextSizes() {
   let text;
   try {
@@ -285,15 +237,80 @@ function readLocalModelContextSizes() {
   return sizes;
 }
 
-const LOCAL_MODEL_SIZES = readLocalModelContextSizes();
+function resolveContextWindow(model, provider) {
+  if (process.env.GOOSE_CONTEXT_WINDOW) {
+    const n = parseInt(process.env.GOOSE_CONTEXT_WINDOW, 10);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  if (model) {
+    // Custom providers are authoritative for the models they define.
+    const { byProvider, byModel } = loadCustomProviders();
+    if (provider) {
+      const perProvider = lookupInMap(byProvider, provider);
+      if (perProvider) {
+        const limit = lookupInMap(perProvider, model);
+        if (limit !== undefined) return limit;
+      }
+    }
+    const byModelLimit = lookupInMap(byModel, model);
+    if (byModelLimit !== undefined) return byModelLimit;
+
+    for (const [re, w] of MODEL_WINDOWS) if (re.test(model)) return w;
+    // The built-in "local" provider is managed by goose itself, so its
+    // GOOSE_LOCAL_MODEL_SETTINGS context_size is authoritative.
+    if (provider === "local") {
+      for (const [key, size] of readLocalModelContextSizes()) {
+        if (key === model || key.startsWith(model + ":")) return size;
+      }
+    }
+  }
+  return DEFAULT_WINDOW;
+}
+
+/**
+ * Context-bar colour triggers, derived from the session's auto-compaction
+ * point so they scale with any context window:
+ *   red    = GOOSE_AUTO_COMPACT_THRESHOLD (goose default 0.8 = 80 % of the
+ *            window; 0.0 disables auto-compaction → legacy 90 % red point)
+ *   yellow = 80 % of red (WARN_RATIO), so the two always move together.
+ * Precedence: server process env → config.yaml root key → goose default.
+ */
+const WARN_RATIO = 0.8;
+const DEFAULT_COMPACT_THRESHOLD = 0.8; // goose's documented default
+const LEGACY_DANGER_PCT = 90;          // red point when auto-compaction is off
+const round2 = (x) => Math.round(x * 100) / 100; // percent display precision
+
+export function resolveBarThresholds() {
+  let t = null; // fraction 0..1; 0 = explicitly disabled; null = unset
+  for (const raw of [
+    process.env.GOOSE_AUTO_COMPACT_THRESHOLD,
+    configRootValue("GOOSE_AUTO_COMPACT_THRESHOLD"),
+  ]) {
+    if (raw === undefined || raw === null || String(raw).trim() === "") continue;
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= 0 && n <= 1) { t = n; break; }
+  }
+  const dangerPct =
+    t === null ? DEFAULT_COMPACT_THRESHOLD * 100
+    : t === 0 ? LEGACY_DANGER_PCT
+    : t * 100;
+  return {
+    compactionThreshold: t === null ? DEFAULT_COMPACT_THRESHOLD : t,
+    dangerPct: round2(dangerPct),
+    warnPct: round2(dangerPct * WARN_RATIO),
+  };
+}
 
 // ---------------------------------------------------------------------------
-// Stats computation
+// Shared stats primitives (used by both the live monitor and the stats engine)
 // ---------------------------------------------------------------------------
 const TPS_WINDOW_MS = 30_000; // rolling window for the tok/s rate
 // goose's real store keeps created_timestamp in whole seconds (some builds and
 // our test fixtures use milliseconds); normalize so rate math is unit-correct.
 const toMs = (ts) => (!ts ? 0 : ts < 1e12 ? ts * 1000 : ts);
+// The session this process reports on, when scoped: goose injects
+// AGENT_SESSION_ID into the stdio env of the session the extension was added
+// to, so each chat's HUD reports on its own chat.
 const AGENT_SESSION_ID = (process.env.AGENT_SESSION_ID || "").trim();
 
 // ---------------------------------------------------------------------------
@@ -391,6 +408,492 @@ function refreshClaim(key, instanceId) {
   return "denied";
 }
 
+// ---------------------------------------------------------------------------
+// Live model-server monitor (llama.cpp GET /slots)
+//
+// goose writes sessions.db only at response-completion time, so the DB is
+// blind while a response streams. llama.cpp's server exposes /slots with a
+// live state: is_processing, next_token[0].n_decoded (output tokens decoded
+// so far) and n_prompt_tokens (measured prompt size). We poll it in the
+// background and report a live "pre-fetched" estimate; when the response
+// completes, the DB value becomes authoritative again (the estimate simply
+// stops being reported).
+//
+// Two server shapes are supported:
+//   * single-model llama-server — bare GET /slots answers with the slot array.
+//   * router mode (--models-preset, one port serving many models) — a bare
+//     GET /slots is refused with HTTP 400 "model name is missing"; slot state
+//     is per-model at GET /slots?model=<name>. That refusal is detected on
+//     the first poll, and from then on the tracked session's model name (from
+//     sessions.db, refreshed on every stats call) is appended to the URL.
+//
+// Router mode adds a backend bypass: the router logs one line per PROXIED
+// request, so steady polling spams its log. The router's router-local
+// GET /v1/models catalog advertises each loaded model's backend host/port
+// (in status.args), so once discovered the monitor polls the backend's own
+// /slots directly — silent, and free to keep the full cadence. The backend
+// cache is re-validated every REVALIDATE_MS (an evicted model's backend can
+// stay alive-but-sleeping for a while) and after 3 consecutive misses (LRU
+// swap → new port). Routers without a usable catalog, and the whole
+// single-model path, fall back to a tiered cadence on the router endpoint:
+// 100 ms for SETTLE_MS after activity, then a HEARTBEAT_POLL_MS heartbeat.
+// All traffic is completion-anchored (AWAIT_MS below): beyond the await
+// window after the last DB completion the monitor is fully dormant, so the
+// backend's --sleep-idle-seconds countdown can elapse and VRAM is freed.
+// ---------------------------------------------------------------------------
+// Adaptive cadence: while a slot is decoding we want the tightest wall-clock
+// measurement possible (it bounds the completion hand-off's duration error —
+// a fixed 250ms grid cost up to ~500ms on short replies), so poll fast; when
+// everything is idle there is nothing to measure, so relax.
+const IDLE_POLL_MS =
+  Number(process.env.GOOSE_SLOT_POLL_MS) > 0 ? Number(process.env.GOOSE_SLOT_POLL_MS) : 100;
+const ACTIVE_POLL_MS = Math.min(
+  Number(process.env.GOOSE_SLOT_ACTIVE_POLL_MS) > 0
+    ? Number(process.env.GOOSE_SLOT_ACTIVE_POLL_MS)
+    : 50,
+  IDLE_POLL_MS
+);
+// Tiered cadence: router-mode servers log every PROXIED request, so a steady
+// 10 Hz idle poll spams the server log 10 lines/s while nothing happens.
+// Keep the 100 ms idle cadence only for SETTLE_MS after the last processing
+// observation (tight hand-off end boundary + tool-loop bursts), then drop to
+// a slow heartbeat until the next activity.
+const SETTLE_MS =
+  Number(process.env.GOOSE_SLOT_SETTLE_MS) > 0 ? Number(process.env.GOOSE_SLOT_SETTLE_MS) : 10_000;
+const HEARTBEAT_POLL_MS =
+  Number(process.env.GOOSE_SLOT_HEARTBEAT_MS) > 0 ? Number(process.env.GOOSE_SLOT_HEARTBEAT_MS) : 1000;
+const REVALIDATE_MS =
+  Number(process.env.GOOSE_SLOT_REVALIDATE_MS) > 0 ? Number(process.env.GOOSE_SLOT_REVALIDATE_MS) : 60_000;
+const DISCOVER_THROTTLE_MS = 2000;
+// Completion-anchored polling: /slots is NOT sleep-timer-exempt, so ANY
+// steady polling (even 1 Hz) keeps the backend awake forever. Instead of a
+// permanent heartbeat we poll only for a bounded window after the last DB
+// completion, then go fully dormant (zero /slots traffic) so the backend's
+// --sleep-idle-seconds countdown can actually elapse and VRAM is freed.
+// The HUD's 5 Hz stats polling reads the DB and updates lastCompletionAt,
+// waking the loop when a new response completes.
+const AWAIT_MS =
+  Number(process.env.GOOSE_SLOT_AWAIT_MS) > 0 ? Number(process.env.GOOSE_SLOT_AWAIT_MS) : 120_000;
+// How often to re-evaluate the dormant condition without making an HTTP call.
+const DORMANT_POLL_MS =
+  Number(process.env.GOOSE_SLOT_DORMANT_POLL_MS) > 0 ? Number(process.env.GOOSE_SLOT_DORMANT_POLL_MS) : 5_000;
+export const slotMonitor = {
+  url: process.env.GOOSE_SLOTS_URL || null, // fixed override (tests)
+  model: "",    // tracked session's model name (scopes /slots in router mode)
+  router: false, // true once the endpoint proved to be a model ROUTER
+  // Backend bypass (router mode): the router logs one line per PROXIED
+  // request, but the per-model backend server it spawns answers its own
+  // /slots silently. The backend's real port is advertised in the
+  // router-local GET /v1/models catalog (status.args carries --host/--port),
+  // so once discovered we poll the backend directly — zero log lines, and
+  // no reason to relax the cadence.
+  backendUrl: null,   // discovered backend /slots URL
+  backendModel: "",   // model the cached backendUrl belongs to
+  backendFails: 0,    // consecutive backend fetch failures (stale backend)
+  lastDiscoverAt: 0,  // t of last /v1/models attempt (throttle + re-validate)
+  state: null,
+  fetchedAt: 0,
+  failures: 0,
+  startAt: null,
+  lastIdleT: 0, // last poll (t) that saw no processing slot
+  samples: [],
+  promptTokens: 0,
+  wasProc: false,
+  lastProcEnd: 0, // t of the last proc→idle transition (drives the settle window)
+  lastCompletionAt: 0, // ms timestamp of the most recent usage_ledger completion
+  generationPending: false, // true when a user message exists without a matching completion
+};
+
+// The backend cache (discovered port) and the decode timeline (hand-off
+// samples) are both per-model, and a model change / rediscovered backend
+// invalidates both — so both resets live here, not inline at each site.
+function clearBackendCache() {
+  slotMonitor.backendUrl = null;
+  slotMonitor.backendModel = "";
+  slotMonitor.backendFails = 0;
+}
+
+// Drop the decode timeline (samples, start, prompt size): a new endpoint
+// (model change, rediscovered backend) starts a fresh slot timeline, so old
+// samples must not leak into the new hand-off estimate.
+function resetSlotTimeline() {
+  slotMonitor.state = null;
+  slotMonitor.fetchedAt = 0;
+  slotMonitor.samples = [];
+  slotMonitor.startAt = null;
+  slotMonitor.wasProc = false;
+  slotMonitor.promptTokens = 0;
+}
+
+function setSlotsUrlForProvider(provider) {
+  if (slotMonitor.url || !provider) return;
+  const { baseUrlByProvider } = loadCustomProviders();
+  const bu = baseUrlByProvider.get(provider);
+  if (!bu) return;
+  try {
+    const u = new URL(bu);
+    u.pathname = u.pathname.replace(/\/+$/, "").replace(/\/v\d+$/, "") + "/slots";
+    slotMonitor.url = u.toString();
+  } catch {
+    /* ignore */
+  }
+}
+
+// In router mode the tracked session's model scopes the /slots request
+// (GET /slots?model=<name>); single-model servers answer bare /slots and
+// the parameter is never appended.
+function slotsUrlNow() {
+  const base = slotMonitor.url;
+  if (!base || !slotMonitor.router || !slotMonitor.model) return base;
+  try {
+    const u = new URL(base);
+    u.searchParams.set("model", slotMonitor.model);
+    return u.toString();
+  } catch {
+    return base;
+  }
+}
+
+// Pure (unit-testable): the backend server's /slots URL for `model` from a
+// router /v1/models catalog. The backend's real host/port ride in the model
+// entry's status.args (the llama-server invocation used to spawn it); a
+// loaded model without parseable args yields null → caller keeps polling
+// the router endpoint (tiered cadence).
+export function backendUrlFromCatalog(catalog, model) {
+  if (!catalog || !Array.isArray(catalog.data)) return null;
+  for (const entry of catalog.data) {
+    if (!entry) continue;
+    const isModel =
+      entry.id === model ||
+      (Array.isArray(entry.aliases) && entry.aliases.includes(model));
+    if (!isModel) continue;
+    const st = entry.status || {};
+    if (st.value !== "loaded") return null;
+    const args = Array.isArray(st.args) ? st.args : [];
+    let host = "127.0.0.1";
+    let port = 0;
+    for (let i = 0; i + 1 < args.length; i++) {
+      if (args[i] === "--port") port = Number(args[i + 1]);
+      else if (args[i] === "--host") host = String(args[i + 1]);
+    }
+    if (!Number.isInteger(port) || port <= 0 || port > 65535) return null;
+    return `http://${host}:${port}/slots`;
+  }
+  return null;
+}
+
+// Throttled backend discovery / re-validation (router mode only). Runs:
+//   - once per REVALIDATE_MS while the cached backend is healthy — closing
+//     the "sleeping backend" trap: llama.cpp's --sleep-idle-seconds can keep
+//     an evicted model's backend alive for a while, so a cached port can
+//     keep "succeeding" against a stale idle backend after an LRU swap;
+//   - immediately after the cached backend failed 3 consecutive fetches
+//     (backend respawned on a new port);
+//   - at most once per DISCOVER_THROTTLE_MS for any reason.
+async function maybeDiscoverBackend() {
+  const m = slotMonitor;
+  if (!m.router || !m.model || !m.url) return;
+  const healthy = m.backendUrl && m.backendModel === m.model && m.backendFails < 3;
+  if (healthy && Date.now() - m.lastDiscoverAt < REVALIDATE_MS) return;
+  if (Date.now() - m.lastDiscoverAt < DISCOVER_THROTTLE_MS) return;
+  m.lastDiscoverAt = Date.now();
+  let catalog = null;
+  try {
+    const base = m.url.replace(/\/slots\/?$/, "");
+    const ctrl = new AbortController();
+    const to = setTimeout(() => ctrl.abort(), 500);
+    const r = await fetch(base + "/v1/models", { signal: ctrl.signal });
+    clearTimeout(to);
+    catalog = await r.json().catch(() => null);
+  } catch {
+    catalog = null; // router unreachable / no catalog → stay on the router endpoint
+  }
+  const found = backendUrlFromCatalog(catalog, m.model);
+  if (found && found !== m.backendUrl) {
+    m.backendUrl = found;
+    m.backendModel = m.model;
+    m.backendFails = 0;
+    // A (re)discovered backend is a new slot timeline — drop samples taken
+    // against the previous endpoint (old model, or the router).
+    resetSlotTimeline();
+  } else if (!found && m.backendUrl) {
+    clearBackendCache(); // model unloaded (or no port info) → router endpoint
+  }
+}
+
+// The tracked session's model name, refreshed on every stats call. A change
+// discards the previous model's decode samples AND its backend cache, so its
+// hand-off cannot be attributed to this session (slots are per-model, not
+// per-session).
+function setSlotsModel(model) {
+  const m = typeof model === "string" ? model.trim() : "";
+  if (m === slotMonitor.model) return;
+  slotMonitor.model = m;
+  clearBackendCache();
+  resetSlotTimeline();
+}
+
+async function pollSlots() {
+  if (!slotMonitor.url) return false;
+  await maybeDiscoverBackend();
+  const viaBackend = !!slotMonitor.backendUrl;
+  const url = viaBackend ? slotMonitor.backendUrl : slotsUrlNow();
+  const hadModel = slotMonitor.router && !!slotMonitor.model;
+  try {
+    const ctrl = new AbortController();
+    const to = setTimeout(() => ctrl.abort(), 200);
+    const r = await fetch(url, { signal: ctrl.signal });
+    clearTimeout(to);
+    const body = await r.json().catch(() => null);
+    if (body === null) throw new Error("http " + r.status);
+    if (Array.isArray(body)) {
+      if (viaBackend) slotMonitor.backendFails = 0;
+      // A bare /slots answering with a plain array means we are NOT talking
+      // to a router after all (single-model server) — drop the flag.
+      if (slotMonitor.router && !viaBackend && !hadModel) slotMonitor.router = false;
+      slotMonitor.state = body;
+      slotMonitor.fetchedAt = Date.now();
+      slotMonitor.failures = 0;
+      return true;
+    }
+    if (viaBackend) return backendMiss(); // a real backend never answers objects
+    // A single-model llama-server always answers /slots with an array, so a
+    // JSON object here (the router's HTTP 400 "model name is missing") means
+    // we are talking to a model ROUTER: mark it and retry once, this time
+    // with the tracked session's model name.
+    if (!slotMonitor.router) {
+      slotMonitor.router = true;
+      console.error(
+        `[token-context] /slots is router-mode (per-model); tracking "${
+          slotMonitor.model || "(unknown model — waiting for a stats call)"
+        }"`
+      );
+      if (slotMonitor.model) return pollSlots();
+      return false; // model arrives with the next stats call
+    }
+    // Router mode, model-scoped request came back empty — the model is
+    // probably unloaded (or the router is momentarily wedged). Nothing to
+    // observe right now; not counted as a fetch failure.
+    return false;
+  } catch {
+    if (viaBackend) return backendMiss();
+    slotMonitor.failures++;
+    if (slotMonitor.failures > 60) {
+      slotMonitor.url = null;
+      slotMonitor.router = false; // re-derived + re-detected on next stats call
+      clearBackendCache();
+    }
+    return false;
+  }
+}
+
+// A fetch against the (believed) backend failed: connection refused (LRU
+// swap), abort (router wedged), or a non-array answer. Three consecutive
+// misses clear the cache and zero lastDiscoverAt so the NEXT poll
+// re-validates against the catalog immediately; meanwhile the loop keeps
+// running on the router endpoint (tiered cadence).
+function backendMiss() {
+  const m = slotMonitor;
+  m.backendFails++;
+  if (m.backendFails >= 3) {
+    clearBackendCache();
+    m.lastDiscoverAt = 0; // force immediate catalog re-validation on next poll
+  }
+  return false;
+}
+
+// Summarize the processing slots in the newest snapshot: how many are busy,
+// the max decoded-so-far count, and the max measured prompt size. The slot
+// is per-server (per-model in router mode), so maxima — not sums — describe
+// "the" generation the tracked session is observing. Shared by the state
+// machine, the cadence gate, and the live display.
+function processingSummary(st) {
+  if (!Array.isArray(st)) return null;
+  let count = 0, estOut = 0, promptTokens = 0;
+  for (const s of st) {
+    if (!s || !s.is_processing) continue;
+    count++;
+    const nt = Array.isArray(s.next_token) ? s.next_token[0] : null;
+    estOut = Math.max(estOut, (nt && nt.n_decoded) || 0);
+    promptTokens = Math.max(promptTokens, s.n_prompt_tokens || 0);
+  }
+  return { count, estOut, promptTokens };
+}
+
+// Slot state machine, driven by the /slots poll loop (NOT by guest stats
+// ticks) so hand-off timestamps sit on the poll grid — 50 ms while
+// decoding — instead of the guest's 200 ms render tick.
+export function slotStateTransition(nowMs) {
+  const sum = processingSummary(slotMonitor.state);
+  if (sum && sum.count > 0) {
+    slotMonitor.promptTokens = sum.promptTokens;
+    if (!slotMonitor.wasProc) {
+      slotMonitor.wasProc = true;
+      slotMonitor.startAt = nowMs;
+      slotMonitor.samples = [];
+    }
+    slotMonitor.samples.push({ t: nowMs, n: sum.estOut });
+    while (slotMonitor.samples.length > 2 && slotMonitor.samples[0].t < nowMs - 8000) {
+      slotMonitor.samples.shift();
+    }
+  } else {
+    if (slotMonitor.wasProc) {
+      slotMonitor.lastProcEnd = nowMs;
+      captureHandoff(nowMs);
+    }
+    slotMonitor.wasProc = false;
+    slotMonitor.startAt = null;
+    slotMonitor.samples = [];
+    slotMonitor.lastIdleT = nowMs;
+  }
+}
+
+// True when the newest /slots snapshot is fresh and shows at least one
+// busy slot. Stale (>1.5s, e.g. fetch failures) → false → idle cadence.
+function isAnySlotProcessing() {
+  const sum = processingSummary(slotMonitor.state);
+  if (!sum || Date.now() - slotMonitor.fetchedAt > 1500) return false;
+  return sum.count > 0;
+}
+
+// Completion hand-off: when a live slot goes idle, remember the final
+// decoded-token count and the ms-resolution wall-clock elapsed time. The DB
+// only stores whole-second timestamps, so this gives lastResponseTps() a
+// precise duration — the idle "last" rate then closely matches goose's own
+// measured per-message rate.
+//
+// Boundary estimation: the true start lies in the grid cell
+// (lastIdleT, firstProcPoll] and the true end in (lastProcSample,
+// idlePoll]. Estimating each boundary at its cell's midpoint removes the
+// systematic polling-grid bias (naive first→last sampling shortens the span
+// by up to half the grid at EACH end).
+export const slotHandoff = { at: 0, tokens: 0, elapsedMs: 0 };
+function captureHandoff(nowMs) {
+  nowMs = nowMs || Date.now();
+  const last = slotMonitor.samples[slotMonitor.samples.length - 1];
+  const startAt = slotMonitor.startAt;
+  if (!last || !startAt || last.n <= 0) return;
+  const startEst =
+    slotMonitor.lastIdleT > 0 && slotMonitor.lastIdleT < startAt
+      ? (slotMonitor.lastIdleT + startAt) / 2
+      : startAt; // no prior idle observation (server just started) → old behavior
+  const endEst = (last.t + nowMs) / 2;
+  const elapsedMs = endEst - startEst;
+  if (elapsedMs < 500 || elapsedMs > 3600_000) return;
+  slotHandoff.at = nowMs;
+  slotHandoff.tokens = last.n;
+  slotHandoff.elapsedMs = elapsedMs;
+}
+// Optional constant calibration (ms) added to the hand-off duration. goose's
+// footer timer includes client-side overhead (serializing/transporting the
+// prompt request, stream finalization) that the model-server window does
+// not; GOOSE_TPS_OFFSET_MS lets a user fold that constant into the idle
+// LAST rate. Default 0 = honest server-side measurement.
+const TPS_OFFSET_MS =
+  process.env.GOOSE_TPS_OFFSET_MS !== "" &&
+  Number.isFinite(Number(process.env.GOOSE_TPS_OFFSET_MS))
+    ? Number(process.env.GOOSE_TPS_OFFSET_MS)
+    : 0;
+
+// Pure (unit-testable): rate from the exact DB output tokens over the
+// hand-off duration — only when the hand-off is fresh and its token count
+// plausibly matches the ledger row (the slot is per-server, not per-session).
+export function handoffRate(outTokens, handoff, nowMs, offsetMs = TPS_OFFSET_MS) {
+  if (!handoff || !handoff.at || handoff.tokens <= 0) return null;
+  if (nowMs - handoff.at > 15_000) return null;
+  const out = outTokens || 0;
+  if (Math.abs(handoff.tokens - out) > Math.max(32, Math.round(out * 0.05))) return null;
+  const durMs = Math.max(100, (handoff.elapsedMs || 0) + (offsetMs || 0));
+  return Math.round((out / (durMs / 1000)) * 10) / 10;
+}
+
+const LIVE_OFF = {
+  active: false, phase: null, estOut: 0, estTps: 0,
+  sinceMs: 0, promptTokens: 0, source: "llama-slots",
+};
+
+// Read-only view over the poll-loop state machine (display only — the
+// samples it reports were timestamped on the 50 ms decode poll grid).
+// `used` is the tracked session's current context size (sessions.total_tokens),
+// used only for the per-server correlation guard below.
+function liveEstimate(used) {
+  const sum = processingSummary(slotMonitor.state);
+  if (!sum || Date.now() - slotMonitor.fetchedAt > 1000) return LIVE_OFF;
+  if (sum.count === 0) return LIVE_OFF;
+  const estOut = sum.estOut;
+  const now = Date.now();
+  // promptTokens comes from the state machine (updated on the poll grid from
+  // the same snapshot), keeping the display consistent with the hand-off.
+  const promptTokens = slotMonitor.promptTokens;
+  let estTps = 0;
+  if (slotMonitor.samples.length >= 2 && estOut > 0) {
+    const a = slotMonitor.samples[0];
+    const b = slotMonitor.samples[slotMonitor.samples.length - 1];
+    if (b.n > a.n && b.t > a.t) {
+      estTps = Math.round(((b.n - a.n) / ((b.t - a.t) / 1000)) * 10) / 10;
+    }
+  }
+  // The slot is per-server, not per-session: only trust it when its prompt
+  // size correlates with the tracked session's context size.
+  const correlated =
+    !used || Math.abs(promptTokens - used) <= Math.max(8192, used * 0.25);
+  return {
+    active: correlated,
+    phase: estOut > 0 ? "decode" : "prompt",
+    estOut,
+    estTps,
+    sinceMs: slotMonitor.startAt ? now - slotMonitor.startAt : 0,
+    promptTokens,
+    source: "llama-slots",
+  };
+}
+
+// Rate of the last completed (non-compaction) response: its output tokens
+// over (completion time - time its request was written to the DB).
+let _lastTpsCache = { key: null, tps: 0, src: "db" };
+function lastResponseTps(db, sessionId) {
+  try {
+    const last = db
+      .prepare(
+        `SELECT created_timestamp, output_tokens FROM usage_ledger
+         WHERE session_id = ? AND is_compaction = 0
+         ORDER BY created_timestamp DESC LIMIT 1`
+      )
+      .get(sessionId);
+    if (!last) return { tps: 0, src: "db" };
+    // Update the completion anchor for the poll loop's await window.
+    slotMonitor.lastCompletionAt = toMs(last.created_timestamp);
+    const key = sessionId + ":" + last.created_timestamp;
+    if (_lastTpsCache.key === key) {
+      return { tps: _lastTpsCache.tps, src: _lastTpsCache.src };
+    }
+    const start = db
+      .prepare(
+        `SELECT MAX(created_timestamp) t FROM messages
+         WHERE session_id = ? AND created_timestamp <= ?`
+      )
+      .get(sessionId, last.created_timestamp);
+    const startMs = start && start.t ? toMs(start.t) : toMs(last.created_timestamp) - 2000;
+    const durMs = Math.max(1000, toMs(last.created_timestamp) - startMs);
+    const out = last.output_tokens || 0;
+    // Completion hand-off: exact DB token count over the live monitor's
+    // ms-resolution duration (falls back to the DB's whole-second span).
+    const hTps = handoffRate(out, slotHandoff, Date.now());
+    const tps = hTps != null ? hTps : Math.round((out / (durMs / 1000)) * 10) / 10;
+    const src = hTps != null ? "handoff" : "db";
+    _lastTpsCache = { key, tps, src };
+    return { tps, src };
+  } catch {
+    return { tps: 0, src: "db" }; // e.g. fixture DB without messages/is_compaction
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Stats computation — the payload of get_context_stats.
+// The DB is authoritative at completion boundaries; the live monitor is
+// authoritative while decoding. tps/tpsMode precedence: live (decoding) >
+// last (completed response, hand-off-calibrated) > 30 s rolling ledger.
+// ---------------------------------------------------------------------------
 const SESSION_COLUMNS = `id, name, provider_name, model_config_json, total_tokens,
               input_tokens, output_tokens, cache_read_tokens,
               accumulated_total_tokens, updated_at`;
@@ -557,472 +1060,6 @@ function computeStats(explicitSessionId) {
 }
 
 // ---------------------------------------------------------------------------
-// Live model-server monitor (llama.cpp GET /slots)
-//
-// goose writes sessions.db only at response-completion time, so the DB is
-// blind while a response streams. llama.cpp's server exposes /slots with a
-// live state: is_processing, next_token[0].n_decoded (output tokens decoded
-// so far) and n_prompt_tokens (measured prompt size). We poll it in the
-// background and report a live "pre-fetched" estimate; when the response
-// completes, the DB value becomes authoritative again (the estimate simply
-// stops being reported).
-//
-// Two server shapes are supported:
-//   * single-model llama-server — bare GET /slots answers with the slot array.
-//   * router mode (--models-preset, one port serving many models) — a bare
-//     GET /slots is refused with HTTP 400 "model name is missing"; slot state
-//     is per-model at GET /slots?model=<name>. That refusal is detected on
-//     the first poll, and from then on the tracked session's model name (from
-//     sessions.db, refreshed on every stats call) is appended to the URL.
-//
-// Router mode adds a backend bypass: the router logs one line per PROXIED
-// request, so steady polling spams its log. The router's router-local
-// GET /v1/models catalog advertises each loaded model's backend host/port
-// (in status.args), so once discovered the monitor polls the backend's own
-// /slots directly — silent, and free to keep the full cadence. The backend
-// cache is re-validated every REVALIDATE_MS (an evicted model's backend can
-// stay alive-but-sleeping for a while) and after 3 consecutive misses (LRU
-// swap → new port). Routers without a usable catalog, and the whole
-// single-model path, fall back to a tiered cadence on the router endpoint:
-// 100 ms for SETTLE_MS after activity, then a HEARTBEAT_POLL_MS heartbeat.
-// ---------------------------------------------------------------------------
-// Adaptive cadence: while a slot is decoding we want the tightest wall-clock
-// measurement possible (it bounds the completion hand-off's duration error —
-// a fixed 250ms grid cost up to ~500ms on short replies), so poll fast; when
-// everything is idle there is nothing to measure, so relax.
-const IDLE_POLL_MS =
-  Number(process.env.GOOSE_SLOT_POLL_MS) > 0 ? Number(process.env.GOOSE_SLOT_POLL_MS) : 100;
-const ACTIVE_POLL_MS = Math.min(
-  Number(process.env.GOOSE_SLOT_ACTIVE_POLL_MS) > 0
-    ? Number(process.env.GOOSE_SLOT_ACTIVE_POLL_MS)
-    : 50,
-  IDLE_POLL_MS
-);
-// Tiered cadence: router-mode servers log every PROXIED request, so a steady
-// 10 Hz idle poll spams the server log 10 lines/s while nothing happens.
-// Keep the 100 ms idle cadence only for SETTLE_MS after the last processing
-// observation (tight hand-off end boundary + tool-loop bursts), then drop to
-// a slow heartbeat until the next activity.
-const SETTLE_MS =
-  Number(process.env.GOOSE_SLOT_SETTLE_MS) > 0 ? Number(process.env.GOOSE_SLOT_SETTLE_MS) : 10_000;
-const HEARTBEAT_POLL_MS =
-  Number(process.env.GOOSE_SLOT_HEARTBEAT_MS) > 0 ? Number(process.env.GOOSE_SLOT_HEARTBEAT_MS) : 1000;
-const REVALIDATE_MS =
-  Number(process.env.GOOSE_SLOT_REVALIDATE_MS) > 0 ? Number(process.env.GOOSE_SLOT_REVALIDATE_MS) : 60_000;
-const DISCOVER_THROTTLE_MS = 2000;
-// Completion-anchored polling: /slots is NOT sleep-timer-exempt, so ANY
-// steady polling (even 1 Hz) keeps the backend awake forever. Instead of a
-// permanent heartbeat we poll only for a bounded window after the last DB
-// completion, then go fully dormant (zero /slots traffic) so the backend's
-// --sleep-idle-seconds countdown can actually elapse and VRAM is freed.
-// The HUD's 5 Hz stats polling reads the DB and updates lastCompletionAt,
-// waking the loop when a new response completes.
-const AWAIT_MS =
-  Number(process.env.GOOSE_SLOT_AWAIT_MS) > 0 ? Number(process.env.GOOSE_SLOT_AWAIT_MS) : 120_000;
-// How often to re-evaluate the dormant condition without making an HTTP call.
-const DORMANT_POLL_MS =
-  Number(process.env.GOOSE_SLOT_DORMANT_POLL_MS) > 0 ? Number(process.env.GOOSE_SLOT_DORMANT_POLL_MS) : 5_000;
-export const slotMonitor = {
-  url: process.env.GOOSE_SLOTS_URL || null, // fixed override (tests)
-  model: "",    // tracked session's model name (scopes /slots in router mode)
-  router: false, // true once the endpoint proved to be a model ROUTER
-  // Backend bypass (router mode): the router logs one line per PROXIED
-  // request, but the per-model backend server it spawns answers its own
-  // /slots silently. The backend's real port is advertised in the
-  // router-local GET /v1/models catalog (status.args carries --host/--port),
-  // so once discovered we poll the backend directly — zero log lines, and
-  // no reason to relax the cadence.
-  backendUrl: null,   // discovered backend /slots URL
-  backendModel: "",   // model the cached backendUrl belongs to
-  backendFails: 0,    // consecutive backend fetch failures (stale backend)
-  lastDiscoverAt: 0,  // t of last /v1/models attempt (throttle + re-validate)
-  state: null,
-  fetchedAt: 0,
-  failures: 0,
-  startAt: null,
-  lastIdleT: 0, // last poll (t) that saw no processing slot
-  samples: [],
-  promptTokens: 0,
-  wasProc: false,
-  lastProcEnd: 0, // t of the last proc→idle transition (drives the settle window)
-  lastCompletionAt: 0, // ms timestamp of the most recent usage_ledger completion
-  generationPending: false, // true when a user message exists without a matching completion
-};
-
-function setSlotsUrlForProvider(provider) {
-  if (slotMonitor.url || !provider) return;
-  const { baseUrlByProvider } = loadCustomProviders();
-  const bu = baseUrlByProvider.get(provider);
-  if (!bu) return;
-  try {
-    const u = new URL(bu);
-    u.pathname = u.pathname.replace(/\/+$/, "").replace(/\/v\d+$/, "") + "/slots";
-    slotMonitor.url = u.toString();
-  } catch {
-    /* ignore */
-  }
-}
-
-// In router mode the tracked session's model scopes the /slots request
-// (GET /slots?model=<name>); single-model servers answer bare /slots and
-// the parameter is never appended.
-function slotsUrlNow() {
-  const base = slotMonitor.url;
-  if (!base || !slotMonitor.router || !slotMonitor.model) return base;
-  try {
-    const u = new URL(base);
-    u.searchParams.set("model", slotMonitor.model);
-    return u.toString();
-  } catch {
-    return base;
-  }
-}
-
-// Pure (unit-testable): the backend server's /slots URL for `model` from a
-// router /v1/models catalog. The backend's real host/port ride in the model
-// entry's status.args (the llama-server invocation used to spawn it); a
-// loaded model without parseable args yields null → caller keeps polling
-// the router endpoint (tiered cadence).
-export function backendUrlFromCatalog(catalog, model) {
-  if (!catalog || !Array.isArray(catalog.data)) return null;
-  for (const entry of catalog.data) {
-    if (!entry) continue;
-    const isModel =
-      entry.id === model ||
-      (Array.isArray(entry.aliases) && entry.aliases.includes(model));
-    if (!isModel) continue;
-    const st = entry.status || {};
-    if (st.value !== "loaded") return null;
-    const args = Array.isArray(st.args) ? st.args : [];
-    let host = "127.0.0.1";
-    let port = 0;
-    for (let i = 0; i + 1 < args.length; i++) {
-      if (args[i] === "--port") port = Number(args[i + 1]);
-      else if (args[i] === "--host") host = String(args[i + 1]);
-    }
-    if (!Number.isInteger(port) || port <= 0 || port > 65535) return null;
-    return `http://${host}:${port}/slots`;
-  }
-  return null;
-}
-
-// Throttled backend discovery / re-validation (router mode only). Runs:
-//   - once per REVALIDATE_MS while the cached backend is healthy — closing
-//     the "sleeping backend" trap: llama.cpp's --sleep-idle-seconds can keep
-//     an evicted model's backend alive for a while, so a cached port can
-//     keep "succeeding" against a stale idle backend after an LRU swap;
-//   - immediately after the cached backend failed 3 consecutive fetches
-//     (backend respawned on a new port);
-//   - at most once per DISCOVER_THROTTLE_MS for any reason.
-async function maybeDiscoverBackend() {
-  const m = slotMonitor;
-  if (!m.router || !m.model || !m.url) return;
-  const healthy = m.backendUrl && m.backendModel === m.model && m.backendFails < 3;
-  if (healthy && Date.now() - m.lastDiscoverAt < REVALIDATE_MS) return;
-  if (Date.now() - m.lastDiscoverAt < DISCOVER_THROTTLE_MS) return;
-  m.lastDiscoverAt = Date.now();
-  let catalog = null;
-  try {
-    const base = m.url.replace(/\/slots\/?$/, "");
-    const ctrl = new AbortController();
-    const to = setTimeout(() => ctrl.abort(), 500);
-    const r = await fetch(base + "/v1/models", { signal: ctrl.signal });
-    clearTimeout(to);
-    catalog = await r.json().catch(() => null);
-  } catch {
-    catalog = null; // router unreachable / no catalog → stay on the router endpoint
-  }
-  const found = backendUrlFromCatalog(catalog, m.model);
-  if (found && found !== m.backendUrl) {
-    m.backendUrl = found;
-    m.backendModel = m.model;
-    m.backendFails = 0;
-    // A (re)discovered backend is a new slot timeline — drop samples taken
-    // against the previous endpoint (old model, or the router).
-    m.state = null;
-    m.fetchedAt = 0;
-    m.samples = [];
-    m.startAt = null;
-    m.wasProc = false;
-    m.promptTokens = 0;
-  } else if (!found && m.backendUrl) {
-    m.backendUrl = null; // model unloaded (or no port info) → router endpoint
-    m.backendModel = "";
-    m.backendFails = 0;
-  }
-}
-
-// The tracked session's model name, refreshed on every stats call. A change
-// discards the previous model's decode samples AND its backend cache, so its
-// hand-off cannot be attributed to this session (slots are per-model, not
-// per-session).
-export function setSlotsModel(model) {
-  const m = typeof model === "string" ? model.trim() : "";
-  if (m === slotMonitor.model) return;
-  slotMonitor.model = m;
-  slotMonitor.backendUrl = null;
-  slotMonitor.backendModel = "";
-  slotMonitor.backendFails = 0;
-  slotMonitor.state = null;
-  slotMonitor.fetchedAt = 0;
-  slotMonitor.samples = [];
-  slotMonitor.startAt = null;
-  slotMonitor.wasProc = false;
-  slotMonitor.promptTokens = 0;
-}
-
-async function pollSlots() {
-  if (!slotMonitor.url) return false;
-  await maybeDiscoverBackend();
-  const viaBackend = !!slotMonitor.backendUrl;
-  const url = viaBackend ? slotMonitor.backendUrl : slotsUrlNow();
-  const hadModel = slotMonitor.router && !!slotMonitor.model;
-  try {
-    const ctrl = new AbortController();
-    const to = setTimeout(() => ctrl.abort(), 200);
-    const r = await fetch(url, { signal: ctrl.signal });
-    clearTimeout(to);
-    const body = await r.json().catch(() => null);
-    if (body === null) throw new Error("http " + r.status);
-    if (Array.isArray(body)) {
-      if (viaBackend) slotMonitor.backendFails = 0;
-      // A bare /slots answering with a plain array means we are NOT talking
-      // to a router after all (single-model server) — drop the flag.
-      if (slotMonitor.router && !viaBackend && !hadModel) slotMonitor.router = false;
-      slotMonitor.state = body;
-      slotMonitor.fetchedAt = Date.now();
-      slotMonitor.failures = 0;
-      return true;
-    }
-    if (viaBackend) return backendMiss(); // a real backend never answers objects
-    // A single-model llama-server always answers /slots with an array, so a
-    // JSON object here (the router's HTTP 400 "model name is missing") means
-    // we are talking to a model ROUTER: mark it and retry once, this time
-    // with the tracked session's model name.
-    if (!slotMonitor.router) {
-      slotMonitor.router = true;
-      console.error(
-        `[token-context] /slots is router-mode (per-model); tracking "${
-          slotMonitor.model || "(unknown model — waiting for a stats call)"
-        }"`
-      );
-      if (slotMonitor.model) return pollSlots();
-      return false; // model arrives with the next stats call
-    }
-    // Router mode, model-scoped request came back empty — the model is
-    // probably unloaded (or the router is momentarily wedged). Nothing to
-    // observe right now; not counted as a fetch failure.
-    return false;
-  } catch {
-    if (viaBackend) return backendMiss();
-    slotMonitor.failures++;
-    if (slotMonitor.failures > 60) {
-      slotMonitor.url = null;
-      slotMonitor.router = false; // re-derived + re-detected on next stats call
-      slotMonitor.backendUrl = null;
-      slotMonitor.backendModel = "";
-      slotMonitor.backendFails = 0;
-    }
-    return false;
-  }
-}
-
-// A fetch against the (believed) backend failed: connection refused (LRU
-// swap), abort (router wedged), or a non-array answer. Three consecutive
-// misses clear the cache and zero lastDiscoverAt so the NEXT poll
-// re-validates against the catalog immediately; meanwhile the loop keeps
-// running on the router endpoint (tiered cadence).
-function backendMiss() {
-  const m = slotMonitor;
-  m.backendFails++;
-  if (m.backendFails >= 3) {
-    m.backendUrl = null;
-    m.backendModel = "";
-    m.backendFails = 0;
-    m.lastDiscoverAt = 0;
-  }
-  return false;
-}
-
-// Slot state machine, driven by the /slots poll loop (NOT by guest stats
-// ticks) so hand-off timestamps sit on the poll grid — 50 ms while
-// decoding — instead of the guest's 200 ms render tick.
-export function slotStateTransition(nowMs) {
-  const st = slotMonitor.state;
-  if (!Array.isArray(st)) return;
-  const proc = st.filter((s) => s && s.is_processing);
-  if (proc.length > 0) {
-    let estOut = 0;
-    let promptTokens = 0;
-    for (const s of proc) {
-      const nt = Array.isArray(s.next_token) ? s.next_token[0] : null;
-      estOut = Math.max(estOut, (nt && nt.n_decoded) || 0);
-      promptTokens = Math.max(promptTokens, s.n_prompt_tokens || 0);
-    }
-    slotMonitor.promptTokens = promptTokens;
-    if (!slotMonitor.wasProc) {
-      slotMonitor.wasProc = true;
-      slotMonitor.startAt = nowMs;
-      slotMonitor.samples = [];
-    }
-    slotMonitor.samples.push({ t: nowMs, n: estOut });
-    while (slotMonitor.samples.length > 2 && slotMonitor.samples[0].t < nowMs - 8000) {
-      slotMonitor.samples.shift();
-    }
-  } else {
-    if (slotMonitor.wasProc) {
-      slotMonitor.lastProcEnd = nowMs;
-      captureHandoff(nowMs);
-    }
-    slotMonitor.wasProc = false;
-    slotMonitor.startAt = null;
-    slotMonitor.samples = [];
-    slotMonitor.lastIdleT = nowMs;
-  }
-}
-
-// True when the newest /slots snapshot is fresh and shows at least one
-// busy slot. Stale (>1.5s, e.g. fetch failures) → false → idle cadence.
-function isAnySlotProcessing() {
-  const st = slotMonitor.state;
-  if (!Array.isArray(st) || Date.now() - slotMonitor.fetchedAt > 1500) return false;
-  return st.some((s) => s && s.is_processing);
-}
-
-// Completion hand-off: when a live slot goes idle, remember the final
-// decoded-token count and the ms-resolution wall-clock elapsed time. The DB
-// only stores whole-second timestamps, so this gives lastResponseTps() a
-// precise duration — the idle "last" rate then closely matches goose's own
-// measured per-message rate.
-//
-// Boundary estimation: the true start lies in the grid cell
-// (lastIdleT, firstProcPoll] and the true end in (lastProcSample,
-// idlePoll]. Estimating each boundary at its cell's midpoint removes the
-// systematic polling-grid bias (naive first→last sampling shortens the span
-// by up to half the grid at EACH end).
-export const slotHandoff = { at: 0, tokens: 0, elapsedMs: 0 };
-export function captureHandoff(nowMs) {
-  nowMs = nowMs || Date.now();
-  const last = slotMonitor.samples[slotMonitor.samples.length - 1];
-  const startAt = slotMonitor.startAt;
-  if (!last || !startAt || last.n <= 0) return;
-  const startEst =
-    slotMonitor.lastIdleT > 0 && slotMonitor.lastIdleT < startAt
-      ? (slotMonitor.lastIdleT + startAt) / 2
-      : startAt; // no prior idle observation (server just started) → old behavior
-  const endEst = (last.t + nowMs) / 2;
-  const elapsedMs = endEst - startEst;
-  if (elapsedMs < 500 || elapsedMs > 3600_000) return;
-  slotHandoff.at = nowMs;
-  slotHandoff.tokens = last.n;
-  slotHandoff.elapsedMs = elapsedMs;
-}
-// Optional constant calibration (ms) added to the hand-off duration. goose's
-// footer timer includes client-side overhead (serializing/transporting the
-// prompt request, stream finalization) that the model-server window does
-// not; GOOSE_TPS_OFFSET_MS lets a user fold that constant into the idle
-// LAST rate. Default 0 = honest server-side measurement.
-const TPS_OFFSET_MS =
-  process.env.GOOSE_TPS_OFFSET_MS !== "" &&
-  Number.isFinite(Number(process.env.GOOSE_TPS_OFFSET_MS))
-    ? Number(process.env.GOOSE_TPS_OFFSET_MS)
-    : 0;
-
-// Pure (unit-testable): rate from the exact DB output tokens over the
-// hand-off duration — only when the hand-off is fresh and its token count
-// plausibly matches the ledger row (the slot is per-server, not per-session).
-export function handoffRate(outTokens, handoff, nowMs, offsetMs = TPS_OFFSET_MS) {
-  if (!handoff || !handoff.at || handoff.tokens <= 0) return null;
-  if (nowMs - handoff.at > 15_000) return null;
-  const out = outTokens || 0;
-  if (Math.abs(handoff.tokens - out) > Math.max(32, Math.round(out * 0.05))) return null;
-  const durMs = Math.max(100, (handoff.elapsedMs || 0) + (offsetMs || 0));
-  return Math.round((out / (durMs / 1000)) * 10) / 10;
-}
-
-const LIVE_OFF = {
-  active: false, phase: null, estOut: 0, estTps: 0,
-  sinceMs: 0, promptTokens: 0, source: "llama-slots",
-};
-
-// Read-only view over the poll-loop state machine (display only — the
-// samples it reports were timestamped on the 50 ms decode poll grid).
-function liveEstimate(used) {
-  const st = slotMonitor.state;
-  if (!Array.isArray(st) || Date.now() - slotMonitor.fetchedAt > 1000) return LIVE_OFF;
-  const proc = st.filter((s) => s && s.is_processing);
-  if (proc.length === 0) return LIVE_OFF;
-  let estOut = 0;
-  for (const s of proc) {
-    const nt = Array.isArray(s.next_token) ? s.next_token[0] : null;
-    estOut = Math.max(estOut, (nt && nt.n_decoded) || 0);
-  }
-  const now = Date.now();
-  const promptTokens = slotMonitor.promptTokens;
-  let estTps = 0;
-  if (slotMonitor.samples.length >= 2 && estOut > 0) {
-    const a = slotMonitor.samples[0];
-    const b = slotMonitor.samples[slotMonitor.samples.length - 1];
-    if (b.n > a.n && b.t > a.t) {
-      estTps = Math.round(((b.n - a.n) / ((b.t - a.t) / 1000)) * 10) / 10;
-    }
-  }
-  // The slot is per-server, not per-session: only trust it when its prompt
-  // size correlates with the tracked session's context size.
-  const correlated =
-    !used || Math.abs(promptTokens - used) <= Math.max(8192, used * 0.25);
-  return {
-    active: correlated,
-    phase: estOut > 0 ? "decode" : "prompt",
-    estOut,
-    estTps,
-    sinceMs: slotMonitor.startAt ? now - slotMonitor.startAt : 0,
-    promptTokens,
-    source: "llama-slots",
-  };
-}
-
-// Rate of the last completed (non-compaction) response: its output tokens
-// over (completion time - time its request was written to the DB).
-let _lastTpsCache = { key: null, tps: 0, src: "db" };
-function lastResponseTps(db, sessionId) {
-  try {
-    const last = db
-      .prepare(
-        `SELECT created_timestamp, output_tokens FROM usage_ledger
-         WHERE session_id = ? AND is_compaction = 0
-         ORDER BY created_timestamp DESC LIMIT 1`
-      )
-      .get(sessionId);
-    if (!last) return { tps: 0, src: "db" };
-    // Update the completion anchor for the poll loop's await window.
-    slotMonitor.lastCompletionAt = toMs(last.created_timestamp);
-    const key = sessionId + ":" + last.created_timestamp;
-    if (_lastTpsCache.key === key) {
-      return { tps: _lastTpsCache.tps, src: _lastTpsCache.src };
-    }
-    const start = db
-      .prepare(
-        `SELECT MAX(created_timestamp) t FROM messages
-         WHERE session_id = ? AND created_timestamp <= ?`
-      )
-      .get(sessionId, last.created_timestamp);
-    const startMs = start && start.t ? toMs(start.t) : toMs(last.created_timestamp) - 2000;
-    const durMs = Math.max(1000, toMs(last.created_timestamp) - startMs);
-    const out = last.output_tokens || 0;
-    // Completion hand-off: exact DB token count over the live monitor's
-    // ms-resolution duration (falls back to the DB's whole-second span).
-    const hTps = handoffRate(out, slotHandoff, Date.now());
-    const tps = hTps != null ? hTps : Math.round((out / (durMs / 1000)) * 10) / 10;
-    const src = hTps != null ? "handoff" : "db";
-    _lastTpsCache = { key, tps, src };
-    return { tps, src };
-  } catch {
-    return { tps: 0, src: "db" }; // e.g. fixture DB without messages/is_compaction
-  }
-}
-
-// ---------------------------------------------------------------------------
 // MCP server
 // ---------------------------------------------------------------------------
 const server = new Server(
@@ -1088,6 +1125,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   };
 });
 
+// Tool arguments arrive untyped over the wire; parse the string ones
+// defensively in one place (trim included).
+const argStr = (args, key) => (typeof args?.[key] === "string" ? args[key].trim() : "");
+
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name } = request.params;
 
@@ -1100,17 +1141,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   if (name === "get_context_stats") {
     const args = request.params.arguments || {};
-    const stats = computeStats(typeof args.session_id === "string" ? args.session_id : "");
-    const instanceId =
-      typeof args.instance_id === "string" ? args.instance_id.trim() : "";
+    const sessionId = argStr(args, "session_id");
+    const stats = computeStats(sessionId);
+    const instanceId = argStr(args, "instance_id");
     if (instanceId && stats && stats.ok !== false) {
       // Claim bookkeeping: the poll is the holder's liveness signal and
       // reports the current holder (the display state). It never changes
       // the holder — only an init-time claim does (v1.4.2).
-      stats.pipClaim = refreshClaim(
-        claimKeyFor(typeof args.session_id === "string" ? args.session_id : ""),
-        instanceId
-      );
+      stats.pipClaim = refreshClaim(claimKeyFor(sessionId), instanceId);
     }
     return {
       content: [{ type: "text", text: JSON.stringify(stats) }],
@@ -1120,8 +1158,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   if (name === "hud_claim") {
     const args = request.params.arguments || {};
-    const instanceId =
-      typeof args.instance_id === "string" ? args.instance_id.trim() : "";
+    const instanceId = argStr(args, "instance_id");
     if (!instanceId) {
       const err = { ok: false, error: "instance_id is required" };
       return {
@@ -1133,9 +1170,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       ok: true,
       granted: false,
       pipClaim: "denied",
-      session: claimKeyFor(
-        typeof args.session_id === "string" ? args.session_id : ""
-      ),
+      session: claimKeyFor(argStr(args, "session_id")),
     };
     res.pipClaim = claimSlot(res.session, instanceId); // init-time claim
     res.granted = res.pipClaim === "granted";
@@ -1188,6 +1223,13 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
   throw new Error(`Resource not found: ${uri}`);
 });
 
+// True while the monitor should keep polling for the tail of the last
+// completed response: within AWAIT_MS of the newest usage_ledger row
+// (lastCompletionAt is refreshed by every stats call, which is what wakes
+// the loop out of dormancy).
+const inAwaitWindow = (now) =>
+  slotMonitor.lastCompletionAt > 0 && now - slotMonitor.lastCompletionAt < AWAIT_MS;
+
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
@@ -1206,12 +1248,7 @@ async function main() {
   // slotMonitor.lastCompletionAt, waking the loop when a new response lands.
   const pollLoop = () => {
     const now = Date.now();
-    const proc = isAnySlotProcessing();
-    const inAwait =
-      slotMonitor.lastCompletionAt > 0 &&
-      now - slotMonitor.lastCompletionAt < AWAIT_MS;
-
-    if (!proc && !inAwait && !slotMonitor.generationPending) {
+    if (!isAnySlotProcessing() && !inAwaitWindow(now) && !slotMonitor.generationPending) {
       // Dormant — skip the HTTP fetch entirely. Re-check the condition
       // periodically; the stats handler updates lastCompletionAt (completion)
       // or generationPending (new user message) to wake the loop.
@@ -1225,14 +1262,11 @@ async function main() {
         if (ok) slotStateTransition(Date.now());
         const now2 = Date.now();
         const proc2 = isAnySlotProcessing();
-        const inAwait2 =
-          slotMonitor.lastCompletionAt > 0 &&
-          now2 - slotMonitor.lastCompletionAt < AWAIT_MS;
         const settling =
           slotMonitor.lastProcEnd > 0 && now2 - slotMonitor.lastProcEnd < SETTLE_MS;
         const delay = proc2
           ? ACTIVE_POLL_MS
-          : inAwait2 || slotMonitor.generationPending
+          : inAwaitWindow(now2) || slotMonitor.generationPending
             ? slotMonitor.backendUrl || settling
               ? IDLE_POLL_MS
               : HEARTBEAT_POLL_MS
@@ -1247,7 +1281,10 @@ async function main() {
 }
 
 // Only start the MCP server when this file is the entry point — unit tests
-// import { handoffRate } without spawning the stdio server.
+// import the exported helpers (handoffRate, slotMonitor, slotStateTransition,
+// resolveBarThresholds, backendUrlFromCatalog, slotHandoff) without spawning
+// the stdio server. The exports exist for the test harness only; the real
+// MCP surface is the three tools + one resource.
 let isMain = true;
 try {
   isMain = !!process.argv[1] && "file://" + process.argv[1] === import.meta.url;

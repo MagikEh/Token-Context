@@ -2,6 +2,20 @@
 
 All notable changes to Token Context. The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.4.5] — 2026-10-14
+
+### Refactor — code cleanup (no user-visible changes)
+
+A zero-context-readability pass over `server.js`. All behaviour is unchanged — the full 82-check suite passes unmodified.
+
+- **Sections reordered to dependency order** (top of file → bottom): SQLite access → context-window resolution → shared stats primitives → HUD claim broker → live `/slots` monitor → stats computation → MCP server → entry point. `computeStats` and `resolveContextWindow` no longer reference code defined below them, and the stats engine no longer sits under the "HUD pop-out claim" banner (it was always stats code).
+- **Duplicated resets extracted**: the backend cache and decode timeline were both reset field-by-field at 4 and 2 sites respectively; they are now `clearBackendCache()` / `resetSlotTimeline()` with the invariant (per-model state) documented in one place.
+- **Duplicated snapshot scans extracted**: `slotStateTransition`, `isAnySlotProcessing`, and `liveEstimate` each re-derived the same "processing slots" summary (count / max `n_decoded` / max prompt tokens); they now share `processingSummary()`.
+- **Small dedups**: the await-window predicate (used twice in the poll loop) is `inAwaitWindow()`; tool-argument parsing in the call handler is `argStr()`; the percent-rounding helper is module-level `round2`.
+- **Config reads are uniformly on-demand**: `GOOSE_LOCAL_MODEL_SETTINGS` context sizes were cached at module load while every other config read was fresh per stats call; they are now read on demand, so a config edit (or a config file briefly unreadable at startup) applies without an extension restart.
+- **API surface trimmed**: `setSlotsModel` / `captureHandoff` were exported but consumed only internally — the exports exist for the test harness only, and that convention is now documented.
+- **Docs**: the header env-var list now covers all knobs (grouped), the stale `1.4.3` server version constant is fixed (matched `package.json`), and WHY comments explain the decisions a maintainer would otherwise have to rediscover (freshness of config reads, completion-anchored dormancy in the monitor banner, the `liveEstimate` correlation guard).
+
 ## [1.4.4] — 2026-10-14
 
 ### Changed — completion-anchored polling (VRAM sleep fix)
