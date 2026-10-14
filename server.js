@@ -500,6 +500,23 @@ function computeStats(explicitSessionId) {
       setSlotsModel(s.model);
       const live = liveEstimate(used);
       const last = lastResponseTps(db, s.id);
+      // Wake signal: a user message exists without a matching completion,
+      // meaning generation is (probably) in progress. This lets the poll
+      // loop wake from dormancy within one stats tick (~200 ms) of the
+      // user hitting send, so the first response after a quiet gap still
+      // gets live tok/s.
+      try {
+        const lastMsg = db.prepare(
+          `SELECT MAX(created_timestamp) t FROM messages WHERE session_id = ?`
+        ).get(s.id);
+        const lastLedger = db.prepare(
+          `SELECT MAX(created_timestamp) t FROM usage_ledger WHERE session_id = ?`
+        ).get(s.id);
+        slotMonitor.generationPending =
+          lastMsg?.t != null && lastLedger?.t != null && lastMsg.t > lastLedger.t + 2;
+      } catch {
+        slotMonitor.generationPending = false;
+      }
       const lastTps = last.tps;
       const tps = live.active ? live.estTps : lastTps > 0 ? lastTps : rolling.tps;
       const tpsMode = live.active ? "live" : lastTps > 0 ? "last" : "rolling";
@@ -629,6 +646,7 @@ export const slotMonitor = {
   wasProc: false,
   lastProcEnd: 0, // t of the last proc→idle transition (drives the settle window)
   lastCompletionAt: 0, // ms timestamp of the most recent usage_ledger completion
+  generationPending: false, // true when a user message exists without a matching completion
 };
 
 function setSlotsUrlForProvider(provider) {
@@ -1193,10 +1211,10 @@ async function main() {
       slotMonitor.lastCompletionAt > 0 &&
       now - slotMonitor.lastCompletionAt < AWAIT_MS;
 
-    if (!proc && !inAwait) {
+    if (!proc && !inAwait && !slotMonitor.generationPending) {
       // Dormant — skip the HTTP fetch entirely. Re-check the condition
-      // periodically; the stats handler will update lastCompletionAt when
-      // a new response completes.
+      // periodically; the stats handler updates lastCompletionAt (completion)
+      // or generationPending (new user message) to wake the loop.
       setTimeout(pollLoop, DORMANT_POLL_MS);
       return;
     }
@@ -1214,7 +1232,7 @@ async function main() {
           slotMonitor.lastProcEnd > 0 && now2 - slotMonitor.lastProcEnd < SETTLE_MS;
         const delay = proc2
           ? ACTIVE_POLL_MS
-          : inAwait2
+          : inAwait2 || slotMonitor.generationPending
             ? slotMonitor.backendUrl || settling
               ? IDLE_POLL_MS
               : HEARTBEAT_POLL_MS
